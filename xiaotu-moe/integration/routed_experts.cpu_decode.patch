@@ -1,0 +1,46 @@
+--- a/vllm/model_executor/layers/fused_moe/routed_experts.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts.py
+@@ -1706,18 +1706,33 @@
+             ).contiguous()
+                  
+     def _cpu_decode(self, hidden_states, topk_weights, topk_ids):
+-        stream_ptr = torch.cuda.current_stream().cuda_stream
+-        self.lk_moe.cpu_decode(
+-            stream_ptr,
+-            hidden_states.size(0),
++        # xiaotu-moe is pure CPU, so it cannot read GPU pointers during
++        # CUDA-graph capture. Mirror `_cpu_prefill`: transfer GPU -> CPU,
++        # compute on CPU, then write into the fixed RoutedExperts.output_gpu
++        # buffer (stable address, CUDA-graph-safe) and cast on return.
++        qlen = hidden_states.size(0)
++        expert_ids_cpu = topk_ids.to(
++            dtype=torch.int32, device='cpu', non_blocking=True
++        )
++        weights_cpu = topk_weights.to(
++            dtype=torch.float32, device='cpu', non_blocking=True
++        )
++        hidden_states_cpu = hidden_states.to(device='cpu', non_blocking=True)
++        output_cpu = torch.empty(
++            (qlen, self.hidden_size), dtype=torch.float32, device='cpu'
++        )
++        torch.cuda.current_stream().synchronize()
++        self.lk_moe.cpu_prefill(
++            qlen,
+             self.top_k,
+-            hidden_states.data_ptr(),
+-            topk_ids.data_ptr(),
+-            topk_weights.data_ptr(),
+-            RoutedExperts.output_gpu.data_ptr()
++            expert_ids_cpu.data_ptr(),
++            weights_cpu.data_ptr(),
++            hidden_states_cpu.data_ptr(),
++            output_cpu.data_ptr(),
+         )
+-        
+-        output = RoutedExperts.output_gpu[:hidden_states.size(0)]
++        # Write into the preallocated GPU buffer (stable address for capture).
++        RoutedExperts.output_gpu[:qlen].copy_(output_cpu, non_blocking=True)
++        output = RoutedExperts.output_gpu[:qlen]
+         if self.check_nan_in_output:
+             torch.nan_to_num(output, nan=0.0, out=output)
+         return output.to(hidden_states.dtype)

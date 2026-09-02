@@ -1,0 +1,150 @@
+--- a/vllm/model_executor/layers/fused_moe/routed_experts.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts.py
+@@ -35,10 +35,10 @@
+ from vllm.utils.platform_utils import is_pin_memory_available
+ from vllm.envs import is_lk_moe_feature_enabled, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, is_in_profile_run
+ if is_lk_moe_feature_enabled():
+-    import  lk_moe  
++    import  xiaotu_moe  
+     logger.info("lk_moe module is available, lk::MOE implementation will be used")
+ else:
+-    logger.error("Failed to import lk_moe module or LVLLM_MOE_NUMA_ENABLED is not set to 1, lk::MOE implementation will not be available")
++    logger.error("Failed to import xiaotu_moe module or LVLLM_MOE_NUMA_ENABLED is not set to 1, lk::MOE implementation will not be available")
+ 
+ 
+ 
+@@ -1363,7 +1363,7 @@
+         num_processes, process_id, gpu_id = self._get_processes_info()
+         
+         # V2: MOEConfigV2 + MOE_WNA16
+-        self.lk_moe_config = lk_moe.MOEConfigV2()
++        self.lk_moe_config = xiaotu_moe.MOEConfigV2()
+         self.lk_moe_config.num_processes = num_processes
+         self.lk_moe_config.process_id = process_id
+         self.lk_moe_config.gpu_id = gpu_id
+@@ -1388,7 +1388,7 @@
+ 
+         # no global scale
+         if self.params_dtype == torch.bfloat16:
+-            self.lk_moe = lk_moe.MOE_WNA16(
++            self.lk_moe = xiaotu_moe.MOE_WNA16(
+                 self.lk_moe_config,
+                 w13_weight_ptr,
+                 w2_weight_ptr,
+@@ -1398,7 +1398,7 @@
+                 0,
+             )
+         else:
+-            self.lk_moe = lk_moe.MOE_WNA16_FP16(
++            self.lk_moe = xiaotu_moe.MOE_WNA16_FP16(
+                 self.lk_moe_config,
+                 w13_weight_ptr,
+                 w2_weight_ptr,
+@@ -1446,7 +1446,7 @@
+         num_processes, process_id, gpu_id = self._get_processes_info()
+ 
+         # V2: MOEConfigV2 + MOE_FP8
+-        self.lk_moe_config = lk_moe.MOEConfigV2()
++        self.lk_moe_config = xiaotu_moe.MOEConfigV2()
+         self.lk_moe_config.num_processes = num_processes
+         self.lk_moe_config.process_id = process_id
+         self.lk_moe_config.gpu_id = gpu_id
+@@ -1471,7 +1471,7 @@
+ 
+         # no global scale
+         if self.params_dtype == torch.bfloat16:
+-            self.lk_moe = lk_moe.MOE_FP8(
++            self.lk_moe = xiaotu_moe.MOE_FP8(
+                 self.lk_moe_config,
+                 w13_weight_ptr,
+                 w2_weight_ptr,
+@@ -1481,7 +1481,7 @@
+                 0,
+             )
+         else:
+-            self.lk_moe = lk_moe.MOE_FP8_FP16(
++            self.lk_moe = xiaotu_moe.MOE_FP8_FP16(
+                 self.lk_moe_config,
+                 w13_weight_ptr,
+                 w2_weight_ptr,
+@@ -1500,7 +1500,7 @@
+         
+         num_processes, process_id, gpu_id = self._get_processes_info()
+         
+-        self.lk_moe_config = lk_moe.MOEConfigV2()
++        self.lk_moe_config = xiaotu_moe.MOEConfigV2()
+         self.lk_moe_config.num_processes = num_processes
+         self.lk_moe_config.process_id = process_id
+         self.lk_moe_config.gpu_id = gpu_id
+@@ -1523,7 +1523,7 @@
+         
+         # no scale
+         if self.params_dtype == torch.bfloat16:
+-            self.lk_moe = lk_moe.MOE_BF16(
++            self.lk_moe = xiaotu_moe.MOE_BF16(
+                 self.lk_moe_config,
+                 w13_ptr,
+                 w2_ptr,
+@@ -1533,7 +1533,7 @@
+                 0,
+             )
+         else:
+-            self.lk_moe = lk_moe.MOE_FP16(
++            self.lk_moe = xiaotu_moe.MOE_FP16(
+                 self.lk_moe_config,
+                 w13_ptr,
+                 w2_ptr,
+@@ -1572,7 +1572,7 @@
+         
+         num_processes, process_id, gpu_id = self._get_processes_info()
+          
+-        self.lk_moe_config = lk_moe.MOEConfigV2()
++        self.lk_moe_config = xiaotu_moe.MOEConfigV2()
+         self.lk_moe_config.num_processes = num_processes
+         self.lk_moe_config.process_id = process_id
+         self.lk_moe_config.gpu_id = gpu_id
+@@ -1597,7 +1597,7 @@
+         
+          
+         if self.params_dtype == torch.bfloat16:
+-            self.lk_moe = lk_moe.MOE_NVFP4(
++            self.lk_moe = xiaotu_moe.MOE_NVFP4(
+                 self.lk_moe_config,
+                 w13_weight_ptr,
+                 w2_weight_ptr,
+@@ -1607,7 +1607,7 @@
+                 w2_weight_global_scale_ptr,
+             )
+         else:
+-            self.lk_moe = lk_moe.MOE_NVFP4_FP16(
++            self.lk_moe = xiaotu_moe.MOE_NVFP4_FP16(
+                 self.lk_moe_config,
+                 w13_weight_ptr,
+                 w2_weight_ptr,
+@@ -1635,7 +1635,7 @@
+         num_processes, process_id, gpu_id = self._get_processes_info()
+ 
+         # V2: MOEConfigV2 + MOE_MXFP4
+-        self.lk_moe_config = lk_moe.MOEConfigV2()
++        self.lk_moe_config = xiaotu_moe.MOEConfigV2()
+         self.lk_moe_config.num_processes = num_processes
+         self.lk_moe_config.process_id = process_id
+         self.lk_moe_config.gpu_id = gpu_id
+@@ -1660,7 +1660,7 @@
+ 
+         # no global scale
+         if self.params_dtype == torch.bfloat16:
+-            self.lk_moe = lk_moe.MOE_MXFP4(
++            self.lk_moe = xiaotu_moe.MOE_MXFP4(
+                 self.lk_moe_config,
+                 w13_weight_ptr,
+                 w2_weight_ptr,
+@@ -1670,7 +1670,7 @@
+                 0,
+             )
+         else:
+-            self.lk_moe = lk_moe.MOE_MXFP4_FP16(
++            self.lk_moe = xiaotu_moe.MOE_MXFP4_FP16(
+                 self.lk_moe_config,
+                 w13_weight_ptr,
+                 w2_weight_ptr,

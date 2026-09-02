@@ -1,0 +1,19 @@
+# Vendored third-party fork (own git repo) — not part of the reimplementation tree
+/Lvllmds4-x/
+
+# Build artifacts (regenerable via scripts/build_variants.sh)
+**/build/
+build/
+
+# Python
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Scratch / logs / notebook junk
+*.log
+*.tmp
+/tmp/
+
+# Regenerable data artifacts (built via scripts/_prep_real.py)
+*.npz
