@@ -75,10 +75,10 @@ PYTHON=$(which python) bash scripts/build.sh   # 构建 avx512_bf16（或最佳�
 
 ## 性能说明
 
-当前 `forward_many` 受带宽限制，按 token×rank 逐个读专家块；两项优化进行中：
+两项优化已实现并实测（详见[项目报告](xiaotu-moe/docs/XIAOTU_MOE_REPORT_cn.md) §10）：
 
-1. **专家归组** — 每个活跃专家只处理一次（对该专家路由到的所有 token 批量 GEMM），DRAM 流量从 `batch×top_k×12 MB` 降到 `活跃专家数×12 MB`（最多 ~7×）。
-2. **Backend_NUMA 等价物** — 持久线程池 + NUMA 节点亲和 + 工作窃取 + NUMA 交织内存（开源参考：Apache-2.0 的 ktransformers `backend_numa.cpp`）。
+1. **专家归组** — `forward_many` 按活跃专家各走一次（自适应 grouped vs 逐 token 派发）。**诚实的实测结论：无提速**——每次 gate_up/down 仍按 assignment 读整块 12MB 专家块（块≫L2，跨 assignment 不缓存），所以仅归组并未真正降 DRAM 流量。真正"每块只读一次"需分块/批量 GEMM + register blocking，留作 future work。
+2. **Backend_NUMA 等价物** — `csrc/moe/numa_pool.hpp`（`NumaWorkPool`）：持久线程池 + NUMA 节点亲和（每个 worker 用 `sched_setaffinity` 钉到不同物理核、跨 NUMA 节点轮转）+ 动态工作窃取 + 对引擎独占的权重快照缓冲做 NUMA 交织内存（raw `mbind` syscall，**不依赖 libnuma**；开源参考：Apache-2.0 的 ktransformers `backend_numa.cpp`）。其完成屏障已改为逐 worker generation 记录，消除跨代竞态。
 
 ## 作者
 

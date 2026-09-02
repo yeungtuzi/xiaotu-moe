@@ -102,15 +102,22 @@ bridge choices.
 
 ## Performance notes
 
-The current `forward_many` is bandwidth-bound and reads each expert block per
-token×rank; two optimizations are in progress:
+Two optimizations were implemented and measured (see §10 of the [project
+report](xiaotu-moe/docs/XIAOTU_MOE_REPORT_en.md)):
 
-1. **Expert grouping** — process each active expert once (batched GEMM over all
-   tokens routed to it), cutting DRAM traffic from `batch×top_k×12 MB` to
-   `active_experts×12 MB` (up to ~7×).
-2. **Backend_NUMA equivalent** — a persistent thread pool with NUMA-node
-   affinity, work stealing, and NUMA-interleaved memory (open reference:
-   Apache-2.0 ktransformers `backend_numa.cpp`).
+1. **Expert grouping** — `forward_many` walks each active expert once (adaptive
+   grouped vs per-token dispatch). Honest measured result: **no speedup** — each
+   gate_up/down still reads its full 12 MB expert block per assignment (block ≫
+   L2, so nothing is reused), so grouping alone does not cut DRAM traffic. A real
+   blocked/batched GEMM with register blocking is future work.
+2. **Backend_NUMA equivalent** — `csrc/moe/numa_pool.hpp` (`NumaWorkPool`): a
+   persistent thread pool with NUMA-node affinity (each worker pinned to a
+   distinct physical core, spread across NUMA nodes via `sched_setaffinity`),
+   dynamic work stealing, and NUMA-interleaved memory for the engine-owned weight
+   snapshots via the raw `mbind` syscall — no libnuma dependency (open reference:
+   Apache-2.0 ktransformers `backend_numa.cpp`). Its completion barrier was
+   hardened with per-worker generation records to eliminate a cross-generation
+   race.
 
 ## Authors
 
