@@ -43,9 +43,12 @@ def main():
     engine = m.MOE_MXFP4(cfg, w13, w2, s13, s2, 0, 0)
 
     print(f"\n{'batch':>5} | {'ms/layer':>9} | {'us/token':>9} | {'MoE tok/s':>10}")
+    # Routing concentration: XIAOTU_MOE_BENCH_CONCENTRATE=N routes tokens only
+    # among experts 0..N-1 (grouped path). Default = E -> diverse (per-token).
+    conc = int(os.environ.get("XIAOTU_MOE_BENCH_CONCENTRATE", E))
     for B in (1, 8, 16, 32, 64):
         x_u16 = rng.integers(0, 65536, (B, H), dtype=np.uint16)
-        ids = rng.integers(0, E, (B, K)).astype(np.int32)
+        ids = rng.integers(0, min(conc, E), (B, K)).astype(np.int32)
         wts = rng.uniform(0, 1, (B, K)).astype(np.float32)
         out = np.zeros((B, H), dtype=np.float32)
         # warmup
@@ -58,6 +61,7 @@ def main():
         ms = dt * 1e3
         us_per_tok = dt / B * 1e6
         print(f"{B:>6} | {ms:>9.2f} | {us_per_tok:>9.1f} | {B/dt:>10.0f}")
+    print(f"(routing concentrated over {min(conc, E)} experts)")
     return 0
 
 

@@ -21,6 +21,7 @@
 #define XIAOTU_MOE_MOE_V2_HPP
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -28,11 +29,13 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
 
 #include "../kernels/bf16_gemm.hpp"
+#include "numa_pool.hpp"   // persistent NUMA-aware worker pool
 
 namespace xiaotu_moe {
 
@@ -166,6 +169,8 @@ public:
         for (auto& th : pool) th.join();
     }
 
+    size_t nthreads() const { return nthreads_; }
+
 private:
     static size_t default_threads() {
         unsigned hw = std::thread::hardware_concurrency();
@@ -181,6 +186,24 @@ private:
     }
     size_t nthreads_;
 };
+
+// Lock-free float accumulate via CAS on the IEEE-754 bit pattern. Used when
+// several expert-grouping jobs contribute to the same token's output in
+// parallel (x86 aligned 32-bit float is not natively atomic to RMW).
+inline void atomic_add_f32(float* p, float v) {
+    std::atomic<uint32_t>* a = reinterpret_cast<std::atomic<uint32_t>*>(p);
+    uint32_t old = a->load(std::memory_order_relaxed);
+    for (;;) {
+        float cur;
+        std::memcpy(&cur, &old, sizeof(cur));
+        float nv = cur + v;
+        uint32_t nbits;
+        std::memcpy(&nbits, &nv, sizeof(nbits));
+        if (a->compare_exchange_weak(old, nbits, std::memory_order_relaxed,
+                                     std::memory_order_relaxed))
+            break;
+    }
+}
 
 // ---- MOE_V2 ----
 template <typename WeightTraits, typename ActivationType>
@@ -255,40 +278,163 @@ public:
         const int nel = cfg_.expert_num;
         const int groupN = cfg_.groupN;
         const int groupK = cfg_.groupK;
+        const size_t NASS = (size_t)M * (size_t)k;
+        if (M <= 0 || k <= 0 || inter <= 0 || hidden <= 0) return;
 
-        // Per-token scratch (thread-local so parallel tokens don't clash).
-        auto compute_token = [&](size_t t) {
+        std::lock_guard<std::mutex> lock(mtx_);
+
+        // Zero the whole output once, up front (was per-token before).
+        std::fill(output, output + (size_t)M * (size_t)hidden, 0.f);
+
+        // --- Expert grouping -------------------------------
+        // Old per-token loop read each expert block once per token×rank, so DRAM
+        // traffic was ~ batch*top_k * (12 MB per expert block). Instead we group
+        // every (token, rank) assignment by its expert and process each active
+        // expert's block ONCE, over all tokens routed to it (the block stays hot
+        // in cache across the expert's token sub-batch). Bandwidth drops to
+        // ~ active_experts * 12 MB (up to ~7x for typical routing diversity).
+        //
+        // Assignment index ai = t*k + r reconstructs the token t=ai/k.
+
+        // per_expert[e] = list of assignment indexes routed to expert e (w!=0).
+        std::vector<std::vector<size_t>> per_expert((size_t)nel);
+        std::vector<int> active;
+        {
+            std::vector<size_t> count((size_t)nel, 0);
+            for (size_t ai = 0; ai < NASS; ++ai) {
+                uint32_t eid = expert_ids[ai];
+                if (eid < (uint32_t)nel && weights[ai] != 0.f) count[eid]++;
+            }
+            for (int e = 0; e < nel; ++e)
+                if (count[e]) { per_expert[e].reserve(count[e]); active.push_back(e); }
+            for (size_t ai = 0; ai < NASS; ++ai) {
+                uint32_t eid = expert_ids[ai];
+                if (eid < (uint32_t)nel && weights[ai] != 0.f) per_expert[eid].push_back(ai);
+            }
+        }
+
+        // SiLU output scratch: one [inter] f32 block per assignment.
+        act_scratch_.resize(NASS * (size_t)inter);
+        // Down output scratch: one [hidden] f32 block per assignment.
+        down_scratch_.resize(NASS * (size_t)hidden);
+
+        // --- Adaptive dispatch ---------------------------------------------
+        // Grouping pays when routing is concentrated (several tokens share an
+        // active expert, so its 12 MB block is re-read from cache instead of
+        // DRAM per token). With diverse routing (almost every expert active for a
+        // handful of tokens) the two-phase + CAS overhead dominates, so we fall
+        // back to the direct per-token loop. Threshold: group only when we have
+        // >= 8 assignments on average per active expert.
+        const size_t nave = active.size();
+        // Grouping-factor threshold: group only when we have >= F assignments on
+        // average per active expert. F defaults to 8; XIAOTU_MOE_GROUP_FACTOR
+        // overrides (a large value forces the per-token path — used to A/B the
+        // two paths on identical routing).
+        static constexpr size_t kDefaultF = 8;
+        size_t F = kDefaultF;
+        if (const char* e = std::getenv("XIAOTU_MOE_GROUP_FACTOR")) {
+            long v = std::atol(e);
+            if (v > 0) F = (size_t)v;
+        }
+        if (nave * F <= NASS) {
+            // --- Grouped path: each active expert's block read once. ---
+            // Jobs split each expert's token list into chunks so fewer active
+            // experts still keep all worker threads busy. Job = (eid, [ab, ae)).
+            struct Job { int eid; size_t ab, ae; };
+            std::vector<Job> jobs;
+            {
+                size_t total_assign = 0;
+                for (int e : active) total_assign += per_expert[e].size();
+                size_t nt = pool_.nthreads();
+                size_t target_jobs = (nt > 4 ? nt * 4 : 16);
+                size_t perjob = total_assign / (target_jobs ? target_jobs : 1);
+                if (perjob < 8) perjob = 8;   // amortize per-job fixed cost
+                if (perjob < 1) perjob = 1;
+                for (int e : active) {
+                    const auto& lst = per_expert[e];
+                    for (size_t b = 0; b < lst.size(); b += perjob)
+                        jobs.push_back({e, b, std::min(b + perjob, lst.size())});
+                }
+            }
+            if (jobs.empty()) return;
+
+            // Phase 1 (parallel over jobs): gate/up + SiLU -> act_scratch_.
+            pool_.parallel_for(jobs.size(), [&](size_t ji) {
+                const Job& job = jobs[ji];
+                const auto& lst = per_expert[job.eid];
+                std::vector<float> gate_buf(inter), up_buf(inter);
+                float* act_base = act_scratch_.data();
+                for (size_t it = job.ab; it < job.ae; ++it) {
+                    size_t ai = lst[it];
+                    size_t t = ai / (size_t)k;
+                    const uint16_t* xt = input + t * (size_t)hidden;
+                    wt::gate_up(xt, w13_, w13_g_, w13_gs_, gate_buf.data(), up_buf.data(),
+                                inter, hidden, job.eid, groupN, groupK);
+                    ::xiaotu_moe::act::silu_gate(gate_buf.data(), up_buf.data(),
+                                                 act_base + ai * (size_t)inter, inter);
+                }
+            });
+
+            // Phase 2 (parallel over jobs): bf16 -> down -> into down_scratch_.
+            // (No cross-expert race on `output`: contributions are staged per
+            // assignment and reduced token-wise in Phase 3.)
+            pool_.parallel_for(jobs.size(), [&](size_t ji) {
+                const Job& job = jobs[ji];
+                const auto& lst = per_expert[job.eid];
+                std::vector<uint16_t> act_bf16(inter);
+                std::vector<float> down_buf(hidden);
+                const float* act_base = act_scratch_.data();
+                float* down_base = down_scratch_.data();
+                for (size_t it = job.ab; it < job.ae; ++it) {
+                    size_t ai = lst[it];
+                    bf16::convert_f32_to_bf16(act_base + ai * (size_t)inter,
+                                              act_bf16.data(), (size_t)inter);
+                    wt::down(act_bf16.data(), w2_, w2_g_, w2_gs_, down_buf.data(),
+                             hidden, inter, job.eid, groupN, groupK);
+                    float* dst = down_base + ai * (size_t)hidden;
+                    std::memcpy(dst, down_buf.data(), (size_t)hidden * sizeof(float));
+                }
+            });
+
+            // Phase 3 (parallel over tokens): weighted reduce, per token, in rank
+            // order — one thread per token, so no output contention.
+            pool_.parallel_for((size_t)M, [&](size_t t) {
+                const float* down_base = down_scratch_.data();
+                float* out_t = output + t * (size_t)hidden;
+                for (int r = 0; r < k; ++r) {
+                    size_t ai = t * (size_t)k + r;
+                    uint32_t eid = expert_ids[ai];
+                    float w = weights[ai];
+                    if (eid >= (uint32_t)nel || w == 0.f) continue;
+                    const float* d = down_base + ai * (size_t)hidden;
+                    for (int h = 0; h < hidden; ++h) out_t[h] += w * d[h];
+                }
+            });
+            return;
+        }
+
+        // --- Fallback: direct per-token loop (diverse routing). ---
+        pool_.parallel_for((size_t)M, [&](size_t t) {
             const uint16_t* xt = input + t * (size_t)hidden;
-            float* out_t = output + t * (size_t)hidden;
-            std::fill(out_t, out_t + hidden, 0.f);
-
+            float* out_t = output + t * (size_t)hidden;   // already zeroed above
             std::vector<float> gate_out(inter), up_out(inter), act_out(inter);
             std::vector<uint16_t> act_bf16(inter);
             std::vector<float> down_out(hidden);
-
             for (int r = 0; r < k; ++r) {
-                uint32_t eid = expert_ids[t * (size_t)k + r];
-                float w = weights[t * (size_t)k + r];
+                size_t ai = t * (size_t)k + r;
+                uint32_t eid = expert_ids[ai];
+                float w = weights[ai];
                 if (eid >= (uint32_t)nel || w == 0.f) continue;
-
-                // gate/up:  (1, inter) = x(1, hidden) x W13^T(2*inter, hidden)
                 wt::gate_up(xt, w13_, w13_g_, w13_gs_, gate_out.data(), up_out.data(),
                             inter, hidden, eid, groupN, groupK);
-                // gated activation
                 ::xiaotu_moe::act::silu_gate(gate_out.data(), up_out.data(),
                                              act_out.data(), inter);
-                // down: (1, hidden) = act(1, inter) x Wd^T(inter, hidden);
-                // act re-quantized to the traits' activation dtype (bf16).
                 bf16::convert_f32_to_bf16(act_out.data(), act_bf16.data(), (size_t)inter);
                 wt::down(act_bf16.data(), w2_, w2_g_, w2_gs_, down_out.data(),
                          hidden, inter, eid, groupN, groupK);
-                // accumulate weighted
-                for (int h = 0; h < hidden; ++h)
-                    out_t[h] += w * down_out[h];
+                for (int h = 0; h < hidden; ++h) out_t[h] += w * down_out[h];
             }
-        };
-
-        pool_.parallel_for((size_t)M, compute_token);
+        });
     }
 
     // forward_one: single token, single routed expert (for warm-up / tests).
@@ -317,7 +463,13 @@ private:
     const void* w2_g_;
     const float* w13_gs_;
     const float* w2_gs_;
-    ThreadPool pool_;
+    // Scratch shared by the two expert-grouping phases within one forward call.
+    // Guarded by mtx_ so accidental concurrent forward_many on the same engine is
+    // safe (the fork processes layers sequentially; concurrent calls are serialized).
+    mutable std::mutex mtx_;
+    std::vector<float> act_scratch_;
+    std::vector<float> down_scratch_;
+    NumaWorkPool pool_;
 };
 
 } // namespace xiaotu_moe

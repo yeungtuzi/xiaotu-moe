@@ -94,6 +94,42 @@
 
 - 仅在 `Lvllmds4-x` 上实测;`Lvllm`(平行线)按 ABI 判定等价(见调查 §1.5),但未单独起服务实测。
 - A6000 / 无 FP8 tensor-core 回退线以及真实 WNA16 模型未在集成环境实测。
-- **性能**:`forward_many` 仍按 token×rank 逐个读专家块(DRAM 流量 ≈ batch×top_k×12MB),且用的是每次调用即建即拆的普通 `std::thread` 池、无 NUMA 感知。两个优化是下一步重点:
-  1. **专家归组** — 每个活跃专家只处理一次(对该专家所有 token 批量 GEMM)→ 带宽 ≈ 活跃专家数×12MB(~7×)。
-  2. **Backend_NUMA 等价物** — 持久线程池 + NUMA 节点亲和 + 工作窃取 + NUMA 交织内存(开源参考:Apache-2.0 的 ktransformers `backend_numa.cpp`)。
+- 下面两个优化**已实现并实测**(见 §10)。基准机被一个无关的常驻 vLLM 服务器(~90 核)持续吃满,时序数据仅作量级参考、非干净的 Roofline 数据。
+
+## 10. 性能优化(实测)
+
+### 10.1 专家归组 — 已实现,**无提速,诚实的负面结果**
+
+`forward_many` 重写为按活跃专家各走一次,而不是按 token×rank:
+1. `per_expert[e]` 为每个活跃专家保存 assignment 下标列表(跳过 `w==0`)。
+2. **自适应派发**:`n_active×F ≤ NASS`(能装进 scratch,F 默认 8,可用 `XIAOTU_MOE_GROUP_FACTOR` 覆盖)走 grouped 路径,否则回退逐 token——两条路径位级可比,便于 A/B。
+3. grouped 路径为 **3 阶段**(消除跨专家 CAS 竞争):
+   - Phase1(按 job 并行):gate/up + SiLU → `act_scratch_`
+   - Phase2(按 job 并行):bf16 + down → `down_scratch_`(不写共享输出)
+   - Phase3(按 token 并行):`out[t] = Σ_r w·down_scratch_[ai]`(每 token 一线程,按 rank 序累加,无竞争)
+
+**正确性**:grouped 与 per-token 参照**逐位一致**(max abs 0、max rel 0);与 numpy golden 相比仍是通常量化误差(MXFP4 在 |ref|>0.05 上 max rel ~8.7e-4)。
+
+**实测(机器受持续外部负载影响,仅量级参考):**
+
+| batch | per-token(diverse 路由)ms/layer | grouped(集中路由)ms/layer |
+|---|---|---|
+| 1  | 76 | 74 |
+| 8  | 76 | 74 |
+| 16 | 76 | 110 |
+| 32 | 152 | 213 |
+| 64 | 303 | 424-430 |
+
+归组**没有降低延迟**;大 batch 下反而明显变慢。**根因**:每次 gate_up/down 仍按 assignment 读各自 12MB 专家块(块远大于 L2,跨 assignment 不缓存)——所以仅归组并没有实现"每块只读一次"。真正"每块只读一次"需要**分块/批量 GEMM + register blocking**,超出本阶段,留作 future work。此诚实负面结论已写入仓库,避免重复踩坑。
+
+### 10.2 Backend_NUMA 等价物 — 持久 NUMA 线程池(已实现,已完成修复)
+
+`csrc/moe/numa_pool.hpp` 提供 `NumaWorkPool`:持久 worker 池,替换每次调用即建即拆的 `ThreadPool`。
+- 持久线程(构造时创建一次,跨调用复用)——去掉每调用建线程的开销。
+- NUMA 亲和:从 `/proc/cpuinfo` + `/sys/devices/system/node` 探测拓扑,每个 worker 用 `sched_setaffinity` 钉到不同物理核、跨 NUMA node 轮转;内存交织用 raw `mbind` syscall——**不依赖 libnuma**。
+- 动态调度:共享原子索引 `counter_.fetch_add(1)`(隐式工作窃取);`parallel_for(n,fn)` 用类代数(generation)完成屏障。
+- 线程数默认=hardware_concurrency,可用 `XIAOTU_MOE_THREADS` 覆盖。
+
+**完成屏障 bug(发现并已修)**:原共享 `done_this_gen_`+`completion_gen_` 计数器存在跨代 reset 竞态,会让 `parallel_for` 在 worker 仍在跑时就返回(压力下 ~80% 崩溃;ASan 证明 worker 在 caller 的 numpy 数组被释放后仍读它)。**修复**:逐 worker 完成记录(`worker_gen_[w]`,`std::atomic<uint64_t>[]`);每个 worker 只写自己的槽位,caller 等每个槽位都等于当前 generation 才返回。无共享累计计数器 reset → 无跨代歧义,可证明不早退。20/20 压力运行 0 崩溃、无死锁。
+
+> **关于"假挂起"的说明**:本机一个无关的常驻 vLLM 服务器(端口 8070,~90 核)把机器 load 顶到 >130;该负载下 pool 的睡眠 worker 偶发被 `cv_` 唤醒要 ~5s,会自恢复,并**非死锁**。在本机测时序/pool 必须计入后台负载;纯 `pthread_barrier`(热驻留线程)实测 ~13µs。

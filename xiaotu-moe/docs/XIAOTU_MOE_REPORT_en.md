@@ -159,11 +159,80 @@ alive (machine has 1.3 TB, ~1.18 TB free at test time).
   ABI (see investigation §1.5) but not separately live-tested.
 - The A6000 / without-FP8 tensor-core fallback line and a real WNA16 model were
   not integration-tested.
-- **Performance**: `forward_many` still reads each expert block per token×rank
-  (DRAM traffic ≈ batch×top_k×12 MB) and uses a plain per-call `std::thread`
-  pool without NUMA awareness. Two optimizations are targeted next:
-  1. **Expert grouping** — process active experts once each (batched GEMM over all
-     tokens assigned to an expert) → bandwidth ≈ active_experts × 12 MB (~7×).
-  2. **Backend_NUMA equivalent** — persistent thread pool with NUMA-node affinity,
-     work stealing, NUMA-interleaved memory (open reference: Apache-2.0
-     ktransformers `backend_numa.cpp`).
+- The two optimizations below (expert grouping + persistent NUMA thread pool)
+  **were implemented and measured** — see §10. Continual-load pollution of the
+  benchmark machine (an unrelated vLLM server saturating ~90 cores) means the
+  timing numbers are order-of-magnitude only, not clean Roofline data.
+
+## 10. Performance optimizations (measured)
+
+### 10.1 Expert grouping — implemented, **no speedup, honest negative result**
+
+`forward_many` was rewritten to walk active experts once each instead of
+per token×rank:
+1. `per_expert[e]` keeps the assignment index list for each active expert (the
+   routing weights `w==0` entries are skipped).
+2. **Adaptive dispatch**: when `n_active×F ≤ NASS` (fits in the scratch space,
+   F defaults to 8, overridable via `XIAOTU_MOE_GROUP_FACTOR`), the grouped path
+   runs; otherwise it falls back to the per-token path. This keeps the two paths
+   bit-comparable for A/B.
+3. The grouped path is **3-phase** to avoid CAS contention across experts:
+   - Phase 1 (parallel over jobs): gate/up + SiLU → `act_scratch_`
+   - Phase 2 (parallel over jobs): bf16 + down → `down_scratch_` (no shared
+     output writes)
+   - Phase 3 (parallel over tokens): `out[t] = Σ_r w·down_scratch_[ai]`
+   (each token one thread, rank-ordered accumulation, no contention)
+
+**Correctness**: grouped vs per-token reference is **bit-identical**
+(max abs 0, max rel 0); grouped vs the numpy golden stays at the usual
+quantization error (max rel ~8.7e-4 relative to |ref|>0.05 for MXFP4).
+
+**Measured result (machine under continual external load — indicative only):**
+
+| batch | per-token (diverse routing) ms/layer | grouped (concentrated) ms/layer |
+|---|---|---|
+| 1  | 76 | 74 |
+| 8  | 76 | 74 |
+| 16 | 76 | 110 |
+| 32 | 152 | 213 |
+| 64 | 303 | 424-430 |
+
+Grouping did **not** reduce latency; at larger batches it made things notably
+slower. **Root cause:** each gate_up/down still reads its full 12 MB expert block
+per assignment (the block is far larger than L2, so nothing is reused across
+assignments) — grouping alone therefore does not achieve "read each block once."
+Actually reading each block once requires a **blocked / batched GEMM with register
+blocking**, which is beyond this phase and remains future work. This honest
+negative result is recorded here and in the repository so it is not re-burned.
+
+### 10.2 Backend_NUMA equivalent — persistent NUMA thread pool (implemented, fixed)
+
+`csrc/moe/numa_pool.hpp` provides `NumaWorkPool`: a persistent worker pool
+replacing the per-call `ThreadPool`.
+- Persistent threads (created once, reused across calls) — removes thread-creation
+  overhead per call.
+- NUMA affinity: topology probed from `/proc/cpuinfo` + `/sys/devices/system/node`;
+  each worker pinned to a distinct physical core, rotating across NUMA nodes via
+  `sched_setaffinity`. Memory interleave uses a raw `mbind` syscall — **no libnuma
+  dependency**.
+- Dynamic scheduling: shared atomic index `counter_.fetch_add(1)` (implicit work
+  stealing); `parallel_for(n, fn)` uses a generation completion barrier.
+- Thread count = hardware concurrency by default, overridable via
+  `XIAOTU_MOE_THREADS`.
+
+**Completion-barrier bug (found & fixed):** the original shared
+`done_this_gen_`+`completion_gen_` counters had a cross-generation reset race that
+let `parallel_for` return while workers were still running (reproduced ~80% crash
+under stress; ASan proved a worker read the caller's numpy array after it was
+freed). **Fix:** per-worker completion records
+(`worker_gen_[w]`, `std::atomic<uint64_t>[]`); each worker only ever writes its own
+slot, and the caller waits until every slot equals the current generation. No
+shared accumulated-counter reset → no cross-generation ambiguity, provably no
+early return. Verified 20/20 stress runs with 0 crashes and no deadlock.
+
+> **Note on "apparent hangs":** on this machine an unrelated persistent vLLM
+> server (port 8070, ~90 cores) keeps the host load >130. The pool's sleeping
+> workers occasionally take ~5 s to be woken by `cv_` under that load, which
+> self-recovers and is **not** a deadlock. Timing/pool measurements on this host
+> must factor in this background load; a plain `pthread_barrier` on hot-resident
+> threads measures ~13 µs.
