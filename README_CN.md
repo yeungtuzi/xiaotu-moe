@@ -80,6 +80,10 @@ PYTHON=$(which python) bash scripts/build.sh   # 构建 avx512_bf16（或最佳�
 1. **专家归组** — 每个活跃专家只处理一次（对该专家路由到的所有 token 批量 GEMM），DRAM 流量从 `batch×top_k×12 MB` 降到 `活跃专家数×12 MB`（最多 ~7×）。
 2. **Backend_NUMA 等价物** — 持久线程池 + NUMA 节点亲和 + 工作窃取 + NUMA 交织内存（开源参考：Apache-2.0 的 ktransformers `backend_numa.cpp`）。
 
+## 作者
+
+**大河马（dahema@me.com）** · **由 DeepSeek Harness 辅助**。
+
 ## 许可
 
 Apache-2.0（构建于 Apache-2.0 的 ktransformers / lktransformers 之上）。不复制任何 lk_moe 专有代码，仅为互操作/理解之用。谱系与许可详见 `LK_MOE_INVESTIGATION_REPORT.md` §6。

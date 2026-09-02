@@ -112,6 +112,10 @@ token×rank; two optimizations are in progress:
    affinity, work stealing, and NUMA-interleaved memory (open reference:
    Apache-2.0 ktransformers `backend_numa.cpp`).
 
+## Authors
+
+**大河马 (dahema@me.com)** · assisted by **DeepSeek Harness**.
+
 ## License
 
 Apache-2.0 (building on Apache-2.0 ktransformers / lktransformers). No
