@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xiaotu-moe"
+version = "0.1.0"
+description = "Open-source, Apache-2.0 CPU implementation (BF16/FP8/WNA16/MXFP4/NVFP4) of the closed-source lk_moe CPU MoE engine, drop-in ABI-compatible with lk_moe.MOEV2"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "大河马", email = "dahema@me.com" },
+]
+keywords = ["moe", "llm", "cpu", "quantization", "mxfp4", "nvfp4", "bf16", "vllm"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[tool.setuptools]
+packages = ["xiaotu_moe"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+xiaotu_moe = ["build/*.so"]

@@ -38,10 +38,19 @@ def _cpu_flags() -> set[str]:
 
 
 def _variant_dir() -> str:
-    """Directory where variant .so files live (repo build/ dir, sibling of the package)."""
+    """Directory where variant .so files live.
+
+    Prefers the in-package ``build/`` dir (wheel layout: the native libraries are
+    bundled inside ``xiaotu_moe/build/`` so a single wheel is self-contained),
+    falling back to the repo-level ``../build`` sibling (development layout,
+    ``build_variants.sh`` output) for source checkouts.
+    """
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
-    candidate = os.path.join(pkg_dir, "..", "build")
-    return os.path.abspath(candidate)
+    for candidate in (os.path.join(pkg_dir, "build"),
+                      os.path.join(pkg_dir, "..", "build")):
+        if os.path.isdir(candidate):
+            return os.path.abspath(candidate)
+    return os.path.abspath(os.path.join(pkg_dir, "..", "build"))
 
 
 def _available_variants(build_dir: str) -> set[str]:

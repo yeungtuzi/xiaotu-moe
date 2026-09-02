@@ -5,6 +5,10 @@
 **/build/
 build/
 
+# Wheel / sdist / egg build artifacts
+dist/
+*.egg-info/
+
 # Python
 **/__pycache__/
 *.pyc
