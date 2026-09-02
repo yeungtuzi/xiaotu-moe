@@ -6,7 +6,9 @@
 # (xiaotu_moe/build/), then builds a properly-tagged platform wheel into dist/.
 #
 # The wheel is NOT "pure": it bundles prebuilt cp312 / x86_64 .so files linked
-# against glibc >= 2.34, so it is tagged cp312-cp312-linux_x86_64 (see setup.py).
+# against glibc >= 2.34, so it is tagged cp312-cp312-manylinux_2_34_x86_64
+# (PyPI requires a PEP 600 manylinux tag, not the generic linux_x86_64; see
+# setup.py).
 #
 # Usage:
 #   scripts/build_release.sh            # build for the active interpreter env

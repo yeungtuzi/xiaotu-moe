@@ -36,7 +36,14 @@ def _py_version() -> str:
 if _bdist_wheel is not None:
 
     class bdist_wheel(_bdist_wheel):
-        """Force cpXY-cpXY-linux_x86_64 tags for the bundled native libs."""
+        """Force cpXY-cpXY-manylinux_2_34_x86_64 tags for the bundled native libs.
+
+        PyPI rejects the generic "linux_x86_64" tag and requires a PEP 600
+        "manylinux_*" tag. Our .so link against glibc <= 2.34 (verified via
+        objdump/readelf GLIBC_* symbol deps), so manylinux_2_34_x86_64 is the
+        correct, minimal platform tag. Building on a glibc >= 2.34 machine
+        (Ubuntu 22.04) satisfies its requirements.
+        """
 
         def finalize_options(self):
             super().finalize_options()
@@ -44,7 +51,7 @@ if _bdist_wheel is not None:
 
         def get_tag(self):
             py = _py_version()
-            return (py, py, "linux_x86_64")
+            return (py, py, "manylinux_2_34_x86_64")
 
 
 cmdclass = {"bdist_wheel": bdist_wheel} if _bdist_wheel is not None else {}
