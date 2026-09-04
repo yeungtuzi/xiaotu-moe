@@ -9,6 +9,15 @@ Versioning: `MAJOR.MINOR`. `0.11` is the first tagged performance-aligned releas
 
 ---
 
+> ⚠️ **DEPRECATED — DO NOT USE 0.1.0**
+> **0.1.0 在实际运行中存在错误，请勿使用。** 请使用 **0.11 或更高版本**。
+> **0.1.0 has runtime errors and must NOT be used — use 0.11 or later.**
+> PyPI cannot delete already-uploaded files, so 0.1.0 remains on PyPI but is
+> deprecated; ignore it and install `xiaotu-moe>=0.11`. Its GitHub release and
+> tag `v0.1.0` have been removed.
+
+---
+
 ## [0.11] — 2026-09-04 — Alignment Iteration toward lk-moe / ktransformers
 
 Core deliverable of the "keep aligning/optimizing xiaotu-moe so performance

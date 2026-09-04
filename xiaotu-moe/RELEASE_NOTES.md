@@ -4,6 +4,11 @@
 **License:** Apache-2.0 · **PyPI:** `xiaotu-moe==0.11`
 **Support:** Python ≥3.10 · cp312 manylinux_2_34_x86_64 wheel
 
+> ⚠️ **DEPRECATED — DO NOT USE 0.1.0** — 0.1.0 has runtime errors and must not
+> be used; PyPI cannot delete it, so ignore the 0.1.0 listing and always install
+> **0.11 or later**: `pip install "xiaotu-moe>=0.11"`. (0.1.0 GitHub release/tag
+> removed.)
+
 ---
 
 ## Summary
