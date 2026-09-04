@@ -57,6 +57,16 @@ static inline int nibble_of(const uint8_t* Wrow, int k) {
     return (k & 1) ? (b >> 4) : (b & 0x0F);
 }
 
+// horizontal sum of a 256-bit vector into a scalar.
+static inline float hsum256(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+
 // fp8_e8m0fnu ("ue8m0") decode: scale = 2^(byte - 127). This is how the fork's
 // Mxfp4MoEMethod feeds DeepSeek-V4-Flash MXFP4 scales (raw uint8 bytes, verified
 // against real lk_moe MOE_MXFP4: median ratio 1.0001 vs torch truth). Lazy
@@ -159,13 +169,16 @@ static inline const float* e8m0_table() {
 // lut: 16-entry float table mapping nibble -> weight value.
 // E8M0: when true, S is a raw uint8 fp8_e8m0 byte buffer (fork MXFP4 feeding),
 // decoded as 2^(byte-127); when false, S is fp32 values (WNA16/NVFP4 feeding).
-template <bool E8M0 = false>
+template <bool E8M0 = false, bool FAST_FP4 = false>
 inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                                  const float* lut, const void* S,
                                  float global_scale, float* C,
                                  int M, int N, int K,
-                                 int groupN, int groupK) {
+                                 int groupN, int groupK,
+                                 int n0 = 0, int n1 = -1) {
     if (K <= 0 || (K & 1)) return;  // packed layout requires even K
+    if (n1 < 0 || n1 > N) n1 = N;
+    if (n1 <= n0) return;
     const int gn = groupN > 0 ? groupN : 1;
     const int gk = groupK > 0 ? groupK : 1;
     const float* Srow = static_cast<const float*>(S);
@@ -175,10 +188,150 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         return Srow[idx];
     };
 #if defined(__AVX2__)
+    // ----------------------------------------------------------------------
+    // FAST FP4 (E2M1) gather-free path, ported from KVCache.AI ktransformers
+    // /kt-kernel/operators/avx2/mxfp4-moe.hpp (Apache-2.0), KT_MXFP4_DECODE_GROUP.
+    // The old per-8-elements _mm256_i32gather_ps from the 16-entry LUT is
+    // latency-bound (~1GB/s vs ~48GB/s memory bandwidth) and was the decode
+    // bottleneck (73ms/layer at M=1). This decode expands a whole 32-value
+    // K-group (16 packed bytes) with one 256-bit PSHUFB into 4 ymm, then folds
+    // with plain FMAs — no gather, bandwidth-bound. Layout is identical to
+    // xiaotu's (byte = 2 consecutive K elements, low nibble = even k).
+    // ----------------------------------------------------------------------
+    if (FAST_FP4 && gk == 32 && (K & 31) == 0 && (size_t)M * (size_t)K <= (size_t)(4 << 20)) {
+        // Decode emission order within each 32-value group (see macro below).
+        static constexpr int kPerm[32] = {0,  2,  4,  6,  1,  3,  5,  7,  8,  10, 12, 14, 9,  11, 13, 15,
+                                          16, 18, 20, 22, 17, 19, 21, 23, 24, 26, 28, 30, 25, 27, 29, 31};
+        // Pre-permute each activation row to FP32 in decode order once, so the
+        // inner loops pair plain loads with the decoded weights.
+        thread_local std::vector<float> a_perm_storage;
+        if (a_perm_storage.size() < (size_t)M * (size_t)K) a_perm_storage.resize((size_t)M * (size_t)K);
+        float* a_perm = a_perm_storage.data();
+        const int group_count = K / 32;
+        for (int mi = 0; mi < M; mi++) {
+            const uint16_t* a_row = A + (size_t)mi * K;
+            float* p_row = a_perm + (size_t)mi * K;
+            for (int g = 0; g < group_count; g++) {
+                const int base = g * 32;
+                for (int j = 0; j < 32; j++) p_row[base + j] = bf16::bf16_to_fp32(a_row[base + kPerm[j]]);
+            }
+        }
+        // E2M1 -> BF16 byte LUTs (same values as packed4::E2M1, APACHE-2.0 ktransformers).
+        alignas(16) static constexpr uint8_t fp4_bf16_lo[16] = {
+            0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,
+            0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0};
+        alignas(16) static constexpr uint8_t fp4_bf16_hi[16] = {
+            0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,
+            0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0};
+        const __m256i lut_lo256 = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)fp4_bf16_lo));
+        const __m256i lut_hi256 = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)fp4_bf16_hi));
+        const __m256i zero256 = _mm256_setzero_si256();
+        const __m128i nib_mask = _mm_set1_epi8(0x0F);
+        // Decode one 32-value K-group at b_row + g*16 bytes into w0..w3.
+        // w0: cols {0,2,4,6|1,3,5,7}; w1: {8,10,12,14|9,11,13,15};
+        // w2: {16,...,22|17,...,23};    w3: {24,...,30|25,...,31}.
+#define XIAOTU_DECODE_GROUP(b_row, g_in)                                                \
+        const __m128i raw_ = _mm_loadu_si128((const __m128i*)((b_row) + (size_t)(g_in) * 16)); \
+        const __m128i lo_ = _mm_and_si128(raw_, nib_mask);                             \
+        const __m128i hi_ = _mm_and_si128(_mm_srli_epi16(raw_, 4), nib_mask);          \
+        const __m256i v_ = _mm256_set_m128i(hi_, lo_);                                 \
+        const __m256i bl_ = _mm256_shuffle_epi8(lut_lo256, v_);                        \
+        const __m256i bh_ = _mm256_shuffle_epi8(lut_hi256, v_);                        \
+        const __m256i u16a_ = _mm256_unpacklo_epi8(bl_, bh_);                          \
+        const __m256i u16b_ = _mm256_unpackhi_epi8(bl_, bh_);                          \
+        const __m256 w0_ = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero256, u16a_)); \
+        const __m256 w1_ = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero256, u16a_)); \
+        const __m256 w2_ = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero256, u16b_)); \
+        const __m256 w3_ = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero256, u16b_))
+
+        for (int j = n0; j < n1; ++j) {
+            const uint8_t* b_row = W + (size_t)j * (K / 2);
+            // ktransformers alignment: prefetch the next weight row ahead of the
+            // FMA stream (bandwidth-bound; hides DRAM latency for the next row).
+            if (j + 1 < n1) {
+                const char* nr = (const char*)(W + (size_t)(j + 1) * (K / 2));
+                _mm_prefetch(nr, _MM_HINT_T0);
+                _mm_prefetch(nr + 64, _MM_HINT_T0);
+                _mm_prefetch(nr + 128, _MM_HINT_T0);
+                _mm_prefetch(nr + 192, _MM_HINT_T0);
+            }
+            // 4-token blocked path: decode each group once, feed 4 accumulators.
+            int mi = 0;
+            for (; mi + 4 <= M; mi += 4) {
+                const float* p0 = a_perm + (size_t)(mi + 0) * K;
+                const float* p1 = a_perm + (size_t)(mi + 1) * K;
+                const float* p2 = a_perm + (size_t)(mi + 2) * K;
+                const float* p3 = a_perm + (size_t)(mi + 3) * K;
+                __m256 tot0 = _mm256_setzero_ps(), tot1 = _mm256_setzero_ps();
+                __m256 tot2 = _mm256_setzero_ps(), tot3 = _mm256_setzero_ps();
+                for (int g = 0; g < group_count; g++) {
+                    const int base = g * 32;
+                    XIAOTU_DECODE_GROUP(b_row, g);
+                    const float scale = scale_at(j, g * 32);
+                    const __m256 sv = _mm256_set1_ps(scale);
+                    __m256 g0 = _mm256_mul_ps(_mm256_loadu_ps(p0 + base), w0_);
+                    g0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 8), w1_, g0);
+                    g0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 16), w2_, g0);
+                    g0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 24), w3_, g0);
+                    __m256 g1 = _mm256_mul_ps(_mm256_loadu_ps(p1 + base), w0_);
+                    g1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 8), w1_, g1);
+                    g1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 16), w2_, g1);
+                    g1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 24), w3_, g1);
+                    __m256 g2 = _mm256_mul_ps(_mm256_loadu_ps(p2 + base), w0_);
+                    g2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 8), w1_, g2);
+                    g2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 16), w2_, g2);
+                    g2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 24), w3_, g2);
+                    __m256 g3 = _mm256_mul_ps(_mm256_loadu_ps(p3 + base), w0_);
+                    g3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 8), w1_, g3);
+                    g3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 16), w2_, g3);
+                    g3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 24), w3_, g3);
+                    tot0 = _mm256_fmadd_ps(g0, sv, tot0);
+                    tot1 = _mm256_fmadd_ps(g1, sv, tot1);
+                    tot2 = _mm256_fmadd_ps(g2, sv, tot2);
+                    tot3 = _mm256_fmadd_ps(g3, sv, tot3);
+                }
+                C[(size_t)(mi + 0) * N + j] = hsum256(tot0) * global_scale;
+                C[(size_t)(mi + 1) * N + j] = hsum256(tot1) * global_scale;
+                C[(size_t)(mi + 2) * N + j] = hsum256(tot2) * global_scale;
+                C[(size_t)(mi + 3) * N + j] = hsum256(tot3) * global_scale;
+            }
+            // Single-row remainder (also the whole decode path when M == 1).
+            for (; mi < M; mi++) {
+                const float* p0 = a_perm + (size_t)mi * K;
+                __m256 total0 = _mm256_setzero_ps();
+                __m256 total1 = _mm256_setzero_ps();
+                for (int g = 0; g < group_count; g++) {
+                    const int base = g * 32;
+                    XIAOTU_DECODE_GROUP(b_row, g);
+                    __m256 gacc = _mm256_mul_ps(_mm256_loadu_ps(p0 + base), w0_);
+                    gacc = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 8), w1_, gacc);
+                    gacc = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 16), w2_, gacc);
+                    gacc = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 24), w3_, gacc);
+                    const float scale = scale_at(j, g * 32);
+                    const __m256 sv = _mm256_set1_ps(scale);
+                    if (g & 1)
+                        total1 = _mm256_fmadd_ps(gacc, sv, total1);
+                    else
+                        total0 = _mm256_fmadd_ps(gacc, sv, total0);
+                }
+                C[(size_t)mi * N + j] = hsum256(_mm256_add_ps(total0, total1)) * global_scale;
+            }
+        }
+        return;
+    }
+    // FAST_FP4 cross-parity fallback (gk != 32 or K%32 != 0): FP4 E2M1 dequant
+    // without a per-8-elements gather. The values are mag[nib & 7] * sign, with
+    // mag in {0,.5,1,1.5,2,3,4,6} and sign = +/-1 from bit 3. A gather from the
+    // 16-entry LUT is latency-bound and was ~70x slower than memory bandwidth in
+    // the M=1 GEMV hot loop; two permutevar8x32 lookups + one mul replace it.
+    static constexpr float kMag8[8] = {0.0f, 0.5f, 1.0f, 1.5f,
+                                      2.0f, 3.0f, 4.0f, 6.0f};
+    const __m256 mag_tab = _mm256_loadu_ps(kMag8);
+    const __m256 sign_tab = _mm256_setr_ps(1.0f, -1.0f, 0, 0, 0, 0, 0, 0);
     for (int i = 0; i < M; ++i) {
         const uint16_t* Arow = A + (size_t)i * K;
         float* Crow = C + (size_t)i * N;
-        for (int j = 0; j < N; ++j) {
+        for (int j = n0; j < n1; ++j) {
             const uint8_t* Wrow = W + (size_t)j * (K / 2);
             __m256 total = _mm256_setzero_ps();
             int kbase = 0;
@@ -186,30 +339,71 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                 __m256 gacc = _mm256_setzero_ps();
                 int k = kbase;
                 int kend = (kbase + gk < K) ? (kbase + gk) : K;
-                for (; k + 8 <= kend; k += 8) {
-                    __m128i a16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Arow + k));
-                    __m256 av = _mm256_castsi256_ps(
-                        _mm256_slli_epi32(_mm256_cvtepu16_epi32(a16), 16));
-                    // 8 elements = 4 packed bytes starting at byte k/2.
-                    uint32_t raw;
-                    std::memcpy(&raw, Wrow + (k / 2), 4);
-                    __m128i b = _mm_cvtsi32_si128((int)raw);
-                    __m128i lo = _mm_and_si128(b, _mm_set1_epi8(0x0F));
-                    __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), _mm_set1_epi8(0x0F));
-                    __m128i nib = _mm_unpacklo_epi8(lo, hi);  // 8 nibble indices
-                    __m256i idx = _mm256_cvtepu8_epi32(nib);
-                    __m256 wv = _mm256_i32gather_ps(lut, idx, 4);
-                    gacc = _mm256_fmadd_ps(av, wv, gacc);
-                }
-                float gscalar = 0.f;
-                for (; k < kend; ++k)
-                    gscalar += bf16::bf16_to_fp32(Arow[k]) * lut[nibble_of(Wrow, k)];
-                float scale = scale_at(j, kbase);
-                total = _mm256_fmadd_ps(gacc, _mm256_set1_ps(scale), total);
-                if (gscalar != 0.f) {
-                    float t[8]; _mm256_storeu_ps(t, total);
-                    t[0] += gscalar * scale;
-                    total = _mm256_loadu_ps(t);
+                if constexpr (FAST_FP4) {
+                    __m256 pre = _mm256_setzero_ps();
+                    for (; k + 8 <= kend; k += 8) {
+                        __m128i a16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Arow + k));
+                        __m256 av = _mm256_castsi256_ps(
+                            _mm256_slli_epi32(_mm256_cvtepu16_epi32(a16), 16));
+                        uint32_t raw;
+                        std::memcpy(&raw, Wrow + (k / 2), 4);
+                        __m128i b = _mm_cvtsi32_si128((int)raw);
+                        __m128i lo = _mm_and_si128(b, _mm_set1_epi8(0x0F));
+                        __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), _mm_set1_epi8(0x0F));
+                        __m128i nib = _mm_unpacklo_epi8(lo, hi);  // 8 nibbles
+                        __m256i magidx = _mm256_cvtepu8_epi32(
+                            _mm_and_si128(nib, _mm_set1_epi8(7)));
+                        __m256 mag = _mm256_permutevar8x32_ps(mag_tab, magidx);
+                        // sign bit = bit 3 -> shift each 16-bit lane right 3,
+                        // mask the low byte's bit0 (which was nib bit 3).
+                        __m128i s3 = _mm_srli_epi16(nib, 3);
+                        __m256i signidx = _mm256_cvtepu8_epi32(
+                            _mm_and_si128(s3, _mm_set1_epi8(1)));
+                        __m256 sign = _mm256_permutevar8x32_ps(sign_tab, signidx);
+                        __m256 wv = _mm256_mul_ps(mag, sign);
+                        // scale deferred: fold at group end
+                        pre = _mm256_fmadd_ps(av, wv, pre);
+                    }
+                    float pre_scalar = 0.f;
+                    for (; k < kend; ++k) {
+                        int nib = (Wrow[k / 2] >> (k & 1 ? 4 : 0)) & 0x0F;
+                        float v = kMag8[nib & 7] * ((nib & 8) ? -1.0f : 1.0f);
+                        pre_scalar += bf16::bf16_to_fp32(Arow[k]) * v;
+                    }
+                    float scale = scale_at(j, kbase);
+                    total = _mm256_fmadd_ps(pre, _mm256_set1_ps(scale), total);
+                    if (pre_scalar != 0.f) {
+                        float t[8]; _mm256_storeu_ps(t, total);
+                        t[0] += pre_scalar * scale;
+                        total = _mm256_loadu_ps(t);
+                    }
+                } else {
+                    __m256 gacc = _mm256_setzero_ps();
+                    for (; k + 8 <= kend; k += 8) {
+                        __m128i a16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Arow + k));
+                        __m256 av = _mm256_castsi256_ps(
+                            _mm256_slli_epi32(_mm256_cvtepu16_epi32(a16), 16));
+                        // 8 elements = 4 packed bytes starting at byte k/2.
+                        uint32_t raw;
+                        std::memcpy(&raw, Wrow + (k / 2), 4);
+                        __m128i b = _mm_cvtsi32_si128((int)raw);
+                        __m128i lo = _mm_and_si128(b, _mm_set1_epi8(0x0F));
+                        __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), _mm_set1_epi8(0x0F));
+                        __m128i nib = _mm_unpacklo_epi8(lo, hi);  // 8 nibble indices
+                        __m256i idx = _mm256_cvtepu8_epi32(nib);
+                        __m256 wv = _mm256_i32gather_ps(lut, idx, 4);
+                        gacc = _mm256_fmadd_ps(av, wv, gacc);
+                    }
+                    float gscalar = 0.f;
+                    for (; k < kend; ++k)
+                        gscalar += bf16::bf16_to_fp32(Arow[k]) * lut[nibble_of(Wrow, k)];
+                    float scale = scale_at(j, kbase);
+                    total = _mm256_fmadd_ps(gacc, _mm256_set1_ps(scale), total);
+                    if (gscalar != 0.f) {
+                        float t[8]; _mm256_storeu_ps(t, total);
+                        t[0] += gscalar * scale;
+                        total = _mm256_loadu_ps(t);
+                    }
                 }
             }
             float tmp[8]; _mm256_storeu_ps(tmp, total);
@@ -223,7 +417,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
     for (int i = 0; i < M; ++i) {
         const uint16_t* Arow = A + (size_t)i * K;
         float* Crow = C + (size_t)i * N;
-        for (int j = 0; j < N; ++j) {
+        for (int j = n0; j < n1; ++j) {
             const uint8_t* Wrow = W + (size_t)j * (K / 2);
             float acc = 0.f;
             for (int k = 0; k < K; ++k)
@@ -243,10 +437,24 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
 // `Tag` type parameter gives each *configuration* a distinct C++ type so that
 // pybind11 can register MXFP4 and NVFP4 (which share the E2M1 LUT) as separate
 // classes (pybind11 keys registered classes by C++ typeid).
+struct MXFP4Tag;  // forward decl so the base can detect the fast FP4 path
 template <const float (&LUT)[16], typename Tag = void, bool E8M0 = false>
 struct Packed4WeightTraitsBase
     : WeightTraitsBase<Packed4WeightTraitsBase<LUT, Tag, E8M0>> {
     static constexpr bool kE8M0 = E8M0;   // scale stored as 1-byte e8m0 vs fp32
+    // FAST path only for the FP4 E2M1 LUT (MXFP4/NVFP4), where dequant reduces to
+    // mag[nib&7]*sign and avoids the slow gather. WNA16's INT4_CENTER8 table does
+    // not decompose that way and keeps the general gather path.
+    static constexpr bool kFastFP4 = true;
+    // This trait can split the N (row) dimension of each GEMV across worker
+    // threads (ktransformers `split_range_n`). Requires the *_slice_impl below.
+    static constexpr bool kNParallel = true;
+    static constexpr size_t w13_bytes_impl(size_t E, size_t n2, size_t H) {
+        return E * n2 * (H / 2);          // [E][2I][H/2] packed (2 elem/byte)
+    }
+    static constexpr size_t w2_bytes_impl(size_t E, size_t H, size_t I) {
+        return E * H * (I / 2);           // [E][H][I/2] packed (2 elem/byte)
+    }
     static void gate_up_impl(const uint16_t* x, const void* w13, const void* w13_g,
                             const float* w13_gs, float* gate, float* up,
                             int inter, int hidden, size_t eid,
@@ -272,7 +480,7 @@ struct Packed4WeightTraitsBase
             sbase = ones;
         }
         const float gs = w13_gs ? w13_gs[eid] : 1.0f;
-        packed4::matmul_packed4_group<E8M0>(x, base, LUT, sbase, gs, both.data(),
+        packed4::matmul_packed4_group<E8M0, kFastFP4>(x, base, LUT, sbase, gs, both.data(),
                                             1, n2, hidden, groupN, groupK);
         std::copy(both.begin(), both.begin() + inter, gate);
         std::copy(both.begin() + inter, both.end(), up);
@@ -299,8 +507,134 @@ struct Packed4WeightTraitsBase
             sbase = ones;
         }
         const float gs = w2_gs ? w2_gs[eid] : 1.0f;
-        packed4::matmul_packed4_group<E8M0>(act, base, LUT, sbase, gs, down,
+        packed4::matmul_packed4_group<E8M0, kFastFP4>(act, base, LUT, sbase, gs, down,
                                             1, hidden, inter, groupN, groupK);
+    }
+
+    // ---- N-sliced variants (kNParallel) ------------------------------------
+    // Compute gate/up only for rows i in [n0, n1) of `inter`. `both` is [2*inter]:
+    //   gate in [0, inter), up in [inter, 2*inter).
+    static void gate_up_slice_impl(const uint16_t* x, const void* w13, const void* w13_g,
+                                   const float* w13_gs, float* both, int inter, int hidden,
+                                   size_t eid, int groupN, int groupK, int n0, int n1) {
+        if (n1 < 0 || n1 > inter) n1 = inter;
+        if (n1 <= n0) return;
+        const int n2 = 2 * inter;
+        const uint8_t* base = static_cast<const uint8_t*>(w13) + eid * (size_t)n2 * (hidden / 2);
+        const int gn = groupN > 0 ? groupN : 1;
+        const int gk = groupK > 0 ? groupK : 1;
+        const size_t nb = (size_t)(n2 + gn - 1) / gn;
+        const size_t kb = (size_t)(hidden + gk - 1) / gk;
+        const void* sbase = nullptr;
+        if (w13_g) {
+            const size_t byte_off = eid * (nb * kb) * (E8M0 ? 1u : sizeof(float));
+            sbase = static_cast<const char*>(w13_g) + byte_off;
+        } else if constexpr (E8M0) {
+            static const uint8_t ones[1] = {127};
+            sbase = ones;
+        } else {
+            static const float ones[1] = {1.0f};
+            sbase = ones;
+        }
+        const float gs = w13_gs ? w13_gs[eid] : 1.0f;
+        // w13 rows [0, inter) = gate, [inter, 2*inter) = up. gate slice first;
+        // the up call indexes rows [inter+n0, inter+n1) of the same n2 block into
+        // C=both (so both[inter+n0..inter+n1) holds up[n0..n1)).
+        packed4::matmul_packed4_group<E8M0, kFastFP4>(x, base, LUT, sbase, gs, both,
+                                            1, n2, hidden, groupN, groupK, n0, n1);
+        packed4::matmul_packed4_group<E8M0, kFastFP4>(x, base, LUT, sbase, gs, both,
+                                            1, n2, hidden, groupN, groupK, inter + n0, inter + n1);
+    }
+
+    static void down_slice_impl(const uint16_t* act, const void* w2, const void* w2_g,
+                                const float* w2_gs, float* down, int hidden, int inter,
+                                size_t eid, int groupN, int groupK, int n0, int n1) {
+        if (n1 < 0 || n1 > hidden) n1 = hidden;
+        if (n1 <= n0) return;
+        const uint8_t* base = static_cast<const uint8_t*>(w2) + eid * (size_t)hidden * (inter / 2);
+        const int gn = groupN > 0 ? groupN : 1;
+        const int gk = groupK > 0 ? groupK : 1;
+        const size_t nb = (size_t)(hidden + gn - 1) / gn;
+        const size_t kb = (size_t)(inter + gk - 1) / gk;
+        const void* sbase = nullptr;
+        if (w2_g) {
+            const size_t byte_off = eid * (nb * kb) * (E8M0 ? 1u : sizeof(float));
+            sbase = static_cast<const char*>(w2_g) + byte_off;
+        } else if constexpr (E8M0) {
+            static const uint8_t ones[1] = {127};
+            sbase = ones;
+        } else {
+            static const float ones[1] = {1.0f};
+            sbase = ones;
+        }
+        const float gs = w2_gs ? w2_gs[eid] : 1.0f;
+        packed4::matmul_packed4_group<E8M0, kFastFP4>(act, base, LUT, sbase, gs, down,
+                                            1, hidden, inter, groupN, groupK, n0, n1);
+    }
+
+    // ---- Batched N-sliced variants (kNParallel). ----------------------------
+    // Same as the single-instance *_slice_impl but with `me` token-rows of the
+    // SAME expert run in one GEMM call, so the packed kernel (matmul_packed4_group
+    // FAST path) decodes each weight row once and shares it across me rows and
+    // gets M-way FMA ILP via its 4-token blocked loop (ktransformers pattern).
+    static void gate_up_slice_batch_impl(int me, const uint16_t* xg, const void* w13, const void* w13_g,
+                                         const float* w13_gs, float* both_buf, int inter, int hidden,
+                                         size_t eid, int groupN, int groupK, int n0, int n1) {
+        if (me <= 0) return;
+        if (n1 < 0 || n1 > inter) n1 = inter;
+        if (n1 <= n0) return;
+        const int n2 = 2 * inter;
+        const uint8_t* base = static_cast<const uint8_t*>(w13) + eid * (size_t)n2 * (hidden / 2);
+        const int gn = groupN > 0 ? groupN : 1;
+        const int gk = groupK > 0 ? groupK : 1;
+        const size_t nb = (size_t)(n2 + gn - 1) / gn;
+        const size_t kb = (size_t)(hidden + gk - 1) / gk;
+        const void* sbase = nullptr;
+        if (w13_g) {
+            const size_t byte_off = eid * (nb * kb) * (E8M0 ? 1u : sizeof(float));
+            sbase = static_cast<const char*>(w13_g) + byte_off;
+        } else if constexpr (E8M0) {
+            static const uint8_t ones[1] = {127};
+            sbase = ones;
+        } else {
+            static const float ones[1] = {1.0f};
+            sbase = ones;
+        }
+        const float gs = w13_gs ? w13_gs[eid] : 1.0f;
+        // both_buf rows are strided by n2; indices [n0,n1) = gate chunk and
+        // [inter+n0, inter+n1) = up chunk, both over ALL me rows at once.
+        packed4::matmul_packed4_group<E8M0, kFastFP4>(xg, base, LUT, sbase, gs, both_buf,
+                                            me, n2, hidden, groupN, groupK, n0, n1);
+        packed4::matmul_packed4_group<E8M0, kFastFP4>(xg, base, LUT, sbase, gs, both_buf,
+                                            me, n2, hidden, groupN, groupK, inter + n0, inter + n1);
+    }
+
+    static void down_slice_batch_impl(int me, const uint16_t* actg, const void* w2, const void* w2_g,
+                                      const float* w2_gs, float* down_buf, int hidden, int inter,
+                                      size_t eid, int groupN, int groupK, int n0, int n1) {
+        if (me <= 0) return;
+        if (n1 < 0 || n1 > hidden) n1 = hidden;
+        if (n1 <= n0) return;
+        const uint8_t* base = static_cast<const uint8_t*>(w2) + eid * (size_t)hidden * (inter / 2);
+        const int gn = groupN > 0 ? groupN : 1;
+        const int gk = groupK > 0 ? groupK : 1;
+        const size_t nb = (size_t)(hidden + gn - 1) / gn;
+        const size_t kb = (size_t)(inter + gk - 1) / gk;
+        const void* sbase = nullptr;
+        if (w2_g) {
+            const size_t byte_off = eid * (nb * kb) * (E8M0 ? 1u : sizeof(float));
+            sbase = static_cast<const char*>(w2_g) + byte_off;
+        } else if constexpr (E8M0) {
+            static const uint8_t ones[1] = {127};
+            sbase = ones;
+        } else {
+            static const float ones[1] = {1.0f};
+            sbase = ones;
+        }
+        const float gs = w2_gs ? w2_gs[eid] : 1.0f;
+        // down_buf rows strided by hidden; write slice [n0,n1) for all me rows.
+        packed4::matmul_packed4_group<E8M0, kFastFP4>(actg, base, LUT, sbase, gs, down_buf,
+                                            me, hidden, inter, groupN, groupK, n0, n1);
     }
 };
 

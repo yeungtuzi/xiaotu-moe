@@ -25,12 +25,89 @@
 #include <ucontext.h>
 #include <sys/ucontext.h>
 
+#include <cuda_runtime.h>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+
 #include "../moe/moe_v2.hpp"
 #include "../moe/moe_v2_fp8.hpp"
 #include "../moe/moe_v2_packed4.hpp"
 
 namespace py = pybind11;
 using namespace xiaotu_moe;
+
+// ---- capture-safe cpu_decode (mirrors lk_moe) ------------------------------
+// lk_moe's cpu_decode(stream_ptr, ...) is CUDA-graph-capture-safe: it reads the
+// GPU input tensors with async host-to-device-pinned memcpy nodes, runs the CPU
+// MoE compute inside a CUDA host-function node (cudaLaunchHostFunc), and writes
+// the result back to a stable device buffer with an async memcpy node. During
+// stream capture these become recorded graph nodes; at each graph replay the
+// host callback re-runs the CPU compute on the *current* input data and issues
+// the write-back. xiaotu-moe is a pure-CPU engine, so it exact-mirrors this:
+// GPU -> pinned host, forward_many on CPU, pinned host -> device out buffer.
+//
+// A single per-engine CpuDecodeState owns the persistent pinned buffers (sized
+// to the largest qlen seen) plus a reusable host-function context. Buffers are
+// deliberately per-engine: each MoE layer has its own RoutedExperts/lk_moe, so
+// there is no cross-layer aliasing, and decode is serialized per engine.
+//
+// Requires only host-side CUDA runtime API (no device kernels), so the whole
+// module still builds with a plain host compiler once -lcudart is linked.
+struct CpuDecodeState {
+    void* pin_hidden = nullptr;
+    void* pin_ids = nullptr;
+    void* pin_weights = nullptr;
+    void* pin_out = nullptr;
+    size_t cap_hidden = 0, cap_ids = 0, cap_weights = 0, cap_out = 0;
+
+    cudaStream_t stream = nullptr;
+    const void* engine = nullptr;      // MOE* (opaque; typed in the host fn)
+    const uint16_t* hid = nullptr;     // pinned D2H destination (bf16)
+    const uint32_t* ids = nullptr;     // pinned D2H destination (int32)
+    const float* wts = nullptr;        // pinned D2H destination (fp32)
+    float* out = nullptr;              // pinned compute output (fp32)
+    float* outg = nullptr;             // device H2D destination (fp32)
+    int qlen = 0, k = 0;
+    size_t out_bytes = 0;
+    void (*host_fn)(void*) = nullptr;
+
+    void ensure_buffers(size_t nh, size_t ni, size_t nw, size_t no) {
+        if (nh > cap_hidden) {
+            if (pin_hidden) cudaFreeHost(pin_hidden);
+            cudaHostAlloc(&pin_hidden, nh, cudaHostAllocDefault);
+            cap_hidden = nh;
+        }
+        if (ni > cap_ids) {
+            if (pin_ids) cudaFreeHost(pin_ids);
+            cudaHostAlloc(&pin_ids, ni, cudaHostAllocDefault);
+            cap_ids = ni;
+        }
+        if (nw > cap_weights) {
+            if (pin_weights) cudaFreeHost(pin_weights);
+            cudaHostAlloc(&pin_weights, nw, cudaHostAllocDefault);
+            cap_weights = nw;
+        }
+        if (no > cap_out) {
+            if (pin_out) cudaFreeHost(pin_out);
+            cudaHostAlloc(&pin_out, no, cudaHostAllocDefault);
+            cap_out = no;
+        }
+    }
+
+    ~CpuDecodeState() {
+        if (pin_hidden) cudaFreeHost(pin_hidden);
+        if (pin_ids) cudaFreeHost(pin_ids);
+        if (pin_weights) cudaFreeHost(pin_weights);
+        if (pin_out) cudaFreeHost(pin_out);
+    }
+};
+
+// Map engine pointer -> its pinned buffers / host-fn context. Keyed by the
+// MOE* identity; every MOE instance across every type has a unique address, so
+// sharing one map across all template instantiations is safe.
+std::mutex g_cd_mtx;
+std::unordered_map<const void*, std::unique_ptr<CpuDecodeState>> g_cd_state;
 
 // ---- SIGSEGV diagnostics (debug build): print faulting addr + stack ----
 namespace {
@@ -118,18 +195,85 @@ static void bind_moe_class(py::module& m, const char* name) {
             py::arg("w13_scale") = py::int_(0), py::arg("w2_scale") = py::int_(0),
             py::arg("w13_global_scale") = py::int_(0), py::arg("w2_global_scale") = py::int_(0))
         .def("cpu_decode", [](MOE& self,
-                              py::object stream_unused,  // placeholder (GPU stream ptr)
+                              py::object stream_obj,
                               int qlen, int top_k,
                               py::object hidden, py::object expert_ids,
                               py::object weights, py::object out_gpu) {
-            // hidden: [qlen, hidden] bf16 (uint16 storage)
-            // expert_ids/weights: [qlen, top_k]
-            // out_gpu: [qlen, hidden] fp32
-            self.forward_many(qlen, top_k,
-                              as_u32(expert_ids),
-                              as_f32(weights),
-                              as_u16(hidden),
-                              as_f32m(out_gpu));
+            // Capture-safe API mirroring lk_moe.cpu_decode(stream_ptr, ...).
+            //   hidden:  [qlen, hidden] bf16 (uint16 storage) DEVICE
+            //   expert_ids/weights: [qlen, top_k] int32 / fp32 DEVICE
+            //   out_gpu: [qlen, hidden] fp32 DEVICE (stable graph buffer)
+            // CPU MoE runs as a CUDA host-function node: async D2H copies are
+            // recorded into the graph (or just stream-enqueued when eager), the
+            // host callback computes on pinned CPU buffers and writes back with
+            // an async H2D memcpy into out_gpu.
+            const int H = self.config().hidden_size;
+            if (qlen <= 0 || top_k <= 0 || H <= 0) return;
+
+            cudaStream_t s = nullptr;
+            if (!stream_obj.is_none()) {
+                s = reinterpret_cast<cudaStream_t>(
+                        py::cast<long long>(stream_obj));
+            }
+            if (!s) s = 0;  // default stream fallback
+
+            const auto* hid_dev = as_u16(hidden);
+            const auto* ids_dev = as_u32(expert_ids);
+            const auto* wts_dev = as_f32(weights);
+            float* outg_dev = as_f32m(out_gpu);
+
+            const size_t nh = (size_t)qlen * H * sizeof(uint16_t);
+            const size_t ni = (size_t)qlen * top_k * sizeof(uint32_t);
+            const size_t nw = (size_t)qlen * top_k * sizeof(float);
+            const size_t no = (size_t)qlen * H * sizeof(float);
+
+            std::lock_guard<std::mutex> lg(g_cd_mtx);
+            auto& st = g_cd_state[&self];
+            if (!st) st = std::make_unique<CpuDecodeState>();
+            st->ensure_buffers(nh, ni, nw, no);
+
+            st->stream = s;
+            st->engine = &self;
+            st->qlen = qlen;
+            st->k = top_k;
+            st->out_bytes = no;
+            st->hid = (const uint16_t*)st->pin_hidden;
+            st->ids = (const uint32_t*)st->pin_ids;
+            st->wts = (const float*)st->pin_weights;
+            st->out = (float*)st->pin_out;
+            st->outg = outg_dev;
+
+            // 1) Async D2H copies on the caller stream (graph-capturable).
+            cudaMemcpyAsync(st->pin_hidden, hid_dev, nh,
+                            cudaMemcpyDeviceToHost, s);
+            cudaMemcpyAsync(st->pin_ids, ids_dev, ni,
+                            cudaMemcpyDeviceToHost, s);
+            cudaMemcpyAsync(st->pin_weights, wts_dev, nw,
+                            cudaMemcpyDeviceToHost, s);
+
+            // 2) Host-function node: CPU MoE compute ONLY. A CUDA host callback
+            //    may NOT itself enqueue CUDA work (that returns
+            //    cudaErrorNotPermitted), so the H2D write-back is a separate
+            //    stream node placed AFTER this host node. Stream ordering
+            //    guarantees the H2D waits for the callback, i.e. for
+            //    forward_many to finish writing st->out.
+            st->host_fn = [](void* arg) {
+                auto* d = static_cast<CpuDecodeState*>(arg);
+                auto* e = static_cast<MOE*>(const_cast<void*>(d->engine));
+                e->forward_many(d->qlen, d->k, d->ids, d->wts,
+                                d->hid, d->out);
+            };
+            cudaLaunchHostFunc(s, st->host_fn, &*st);
+            // 3) Async H2D write-back into the stable out_gpu device buffer.
+            //    During capture this is recorded as a normal graph node; at
+            //    replay the graph executes D2H -> host(CPU compute) -> H2D.
+            cudaMemcpyAsync(st->outg, st->out, st->out_bytes,
+                            cudaMemcpyHostToDevice, s);
+#ifdef XIAOTU_DEBUG_CD
+            cudaError_t le = cudaGetLastError();
+            if (le != cudaSuccess)
+                fprintf(stderr, "[cd] error after launch: %s\n", cudaGetErrorString(le));
+#endif
         }, py::arg("stream"), py::arg("qlen"), py::arg("top_k"),
            py::arg("hidden"), py::arg("expert_ids"), py::arg("weights"),
            py::arg("out_gpu"))

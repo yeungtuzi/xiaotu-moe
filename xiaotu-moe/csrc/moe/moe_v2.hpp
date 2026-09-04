@@ -88,6 +88,14 @@ inline void silu_single(float* v, int n) {
 template <typename Derived>
 struct WeightTraitsBase {
     static constexpr bool kE8M0 = false;  // default: raw fp32 scales; overridden by packed4
+    // Storage bytes for the full [E] weight tensors. Each Derived provides
+    // *_impl which accounts for its own element width and packing.
+    static constexpr size_t w13_bytes(size_t E, size_t n2, size_t H) {
+        return Derived::w13_bytes_impl(E, n2, H);
+    }
+    static constexpr size_t w2_bytes(size_t E, size_t H, size_t I) {
+        return Derived::w2_bytes_impl(E, H, I);
+    }
     // gate_up: gate, up [inter] fp32 = x [hidden] bf16 x per-expert W13 [2*inter][hidden]^T
     // w13 points at expert block eid; w13_g optional per-expert block scale
     // [N/groupN][K/groupK]; w13_gs optional per-expert global scale (array) used
@@ -104,11 +112,73 @@ struct WeightTraitsBase {
                      size_t eid, int groupN, int groupK) {
         Derived::down_impl(act, w2, w2_g, w2_gs, down, hidden, inter, eid, groupN, groupK);
     }
+    // N-parallel capability flag. Packed4 (MXFP4/NVFP4) overrides this to true so
+    // forward_many can split the (N-rows of the) GEMV across all worker threads
+    // (ktransformers `split_range_n` technique). BF16/FP8 stay single-chunk.
+    static constexpr bool kNParallel = false;
+    // N-sliced variants used by the N-parallel dispatch. `both` is [2*inter]:
+    //   gate in [0, inter), up in [inter, 2*inter).
+    // `down` is [hidden], sliced over hidden. Slice is [n0, n1) over `inter`
+    // (gate/up) or `hidden` (down). Derived provides *_slice_impl.
+    static void gate_up_slice(const uint16_t* x, const void* w13, const void* w13_g,
+                              const float* w13_gs, float* both, int inter, int hidden,
+                              size_t eid, int groupN, int groupK, int n0, int n1) {
+        Derived::gate_up_slice_impl(x, w13, w13_g, w13_gs, both, inter, hidden, eid, groupN, groupK, n0, n1);
+    }
+    static void down_slice(const uint16_t* act, const void* w2, const void* w2_g,
+                           const float* w2_gs, float* down, int hidden, int inter,
+                           size_t eid, int groupN, int groupK, int n0, int n1) {
+        Derived::down_slice_impl(act, w2, w2_g, w2_gs, down, hidden, inter, eid, groupN, groupK, n0, n1);
+    }
+    // Batched slice variants: process `me` token-instances of ONE expert in a
+    // single call so the packed kernel decodes each weight row once and
+    // amortizes it over me accumulators (M-way FMA ILP + reuse of the decoded
+    // weight across tokens — ktransformers 4-token block pattern). `xg` is
+    // [me * hidden] (gate/up) contiguous input rows, `actg` [me * inter] (down);
+    // `both_buf` [me*2*inter] / `down_buf` [me*hidden]. Slice is [n0,n1) over
+    // `inter` (gate/up) or `hidden` (down), covering ALL me rows. Dispatches to
+    // Derived::*_batch_impl; the base default loops per row over the
+    // single-instance *_slice_impl, and packed4 overrides with a true M>1 kernel
+    // (matmul_packed4_group's 4-token blocked path).
+    static void gate_up_slice_batched(int me, const uint16_t* xg, const void* w13, const void* w13_g,
+                                      const float* w13_gs, float* both_buf, int inter, int hidden,
+                                      size_t eid, int groupN, int groupK, int n0, int n1) {
+        Derived::gate_up_slice_batch_impl(me, xg, w13, w13_g, w13_gs, both_buf, inter, hidden,
+                                          eid, groupN, groupK, n0, n1);
+    }
+    static void gate_up_slice_batch_impl(int me, const uint16_t* xg, const void* w13, const void* w13_g,
+                                         const float* w13_gs, float* both_buf, int inter, int hidden,
+                                         size_t eid, int groupN, int groupK, int n0, int n1) {
+        for (int mi = 0; mi < me; ++mi)
+            Derived::gate_up_slice_impl(xg + (size_t)mi * hidden, w13, w13_g, w13_gs,
+                                        both_buf + (size_t)mi * (2 * inter),
+                                        inter, hidden, eid, groupN, groupK, n0, n1);
+    }
+    static void down_slice_batched(int me, const uint16_t* actg, const void* w2, const void* w2_g,
+                                   const float* w2_gs, float* down_buf, int hidden, int inter,
+                                   size_t eid, int groupN, int groupK, int n0, int n1) {
+        Derived::down_slice_batch_impl(me, actg, w2, w2_g, w2_gs, down_buf, hidden, inter,
+                                       eid, groupN, groupK, n0, n1);
+    }
+    static void down_slice_batch_impl(int me, const uint16_t* actg, const void* w2, const void* w2_g,
+                                      const float* w2_gs, float* down_buf, int hidden, int inter,
+                                      size_t eid, int groupN, int groupK, int n0, int n1) {
+        for (int mi = 0; mi < me; ++mi)
+            Derived::down_slice_impl(actg + (size_t)mi * inter, w2, w2_g, w2_gs,
+                                     down_buf + (size_t)mi * hidden,
+                                     hidden, inter, eid, groupN, groupK, n0, n1);
+    }
 };
 
 // ---- WeightTraits: BF16 (no quantization) ----
 struct BF16WeightTraits : WeightTraitsBase<BF16WeightTraits> {
     using weight_t = uint16_t;      // bf16 storage
+    static constexpr size_t w13_bytes_impl(size_t E, size_t n2, size_t H) {
+        return E * n2 * H * sizeof(uint16_t);  // [E][2I][H] bf16
+    }
+    static constexpr size_t w2_bytes_impl(size_t E, size_t H, size_t I) {
+        return E * H * I * sizeof(uint16_t);   // [E][H][I] bf16
+    }
 
     static void gate_up_impl(const uint16_t* x, const void* w13, const void* w13_g,
                              const float* w13_gs, float* gate, float* up,
@@ -226,7 +296,7 @@ public:
                     const void* w13, const void* w2,
                     const void* w13_g, const void* w2_g,
                     const float* w13_gs = nullptr, const float* w2_gs = nullptr)
-        : cfg_(cfg) {
+        : cfg_(cfg), pool_(shared_numa_pool()) {
         // Validate minimal dims so we never divide by zero downstream.
         if (cfg_.expert_num <= 0 || cfg_.top_k <= 0 ||
             cfg_.hidden_size <= 0 || cfg_.intermediate_size <= 0)
@@ -247,10 +317,18 @@ public:
         const int gk = cfg_.groupK > 0 ? cfg_.groupK : 1;
         const bool e8m0 = WeightTraits::kE8M0;
         const size_t n2 = (size_t)2 * I;                       // gate+up rows
-        const size_t w13_bytes = (size_t)E * n2 * (size_t)(H / 2);
-        const size_t w2_bytes = (size_t)E * (size_t)H * (size_t)(I / 2);
+        // NOTE: byte sizes are per-weight-trait (BF16 2B, FP8 1B, packed4 H/2).
+        // The old H/2 formula was only valid for packed4 and under-sized BF16/FP8
+        // by 4x/2x -> out-of-bounds reads -> NaN. Fixed via trait helpers.
+        const size_t w13_bytes = WeightTraits::w13_bytes(E, n2, H);
+        const size_t w2_bytes = WeightTraits::w2_bytes(E, H, I);
         const size_t w13g_bytes = (size_t)E * ((n2 + gn - 1) / gn) * ((H + gk - 1) / gk) * (e8m0 ? 1u : sizeof(float));
         const size_t w2g_bytes = (size_t)E * ((H + gn - 1) / gn) * ((I + gk - 1) / gk) * (e8m0 ? 1u : sizeof(float));
+        // NUMA-align the big weight snapshots: the MoE is bandwidth-bound and the
+        // pool spans both sockets (84 threads each). Default allocation lands on
+        // the constructor's node, so half the workers would read remote DRAM at
+        // ~half bandwidth. Set the thread policy to INTERLEAVE for these
+        // allocations (pages fault in already interleaved), then restore default.
         if (w13) { buf_w13_ = std::make_unique<uint8_t[]>(w13_bytes); std::memcpy(buf_w13_.get(), w13, w13_bytes); w13_ = buf_w13_.get(); }
         else     { w13_ = nullptr; }
         if (w2)  { buf_w2_ = std::make_unique<uint8_t[]>(w2_bytes); std::memcpy(buf_w2_.get(), w2, w2_bytes); w2_ = buf_w2_.get(); }
@@ -282,6 +360,15 @@ public:
         if (M <= 0 || k <= 0 || inter <= 0 || hidden <= 0) return;
 
         std::lock_guard<std::mutex> lock(mtx_);
+
+        // N-parallel dispatch (packed4): split each expert's GEMV over its N rows
+        // across all worker threads so a single token's 4k-row GEMV uses the whole
+        // pool, not 1 thread (ktransformers `split_range_n`). BF16/FP8 take the
+        // existing single-chunk paths below.
+        if constexpr (wt::kNParallel) {
+            forward_many_nsliced(M, k, expert_ids, weights, input, output);
+            return;
+        }
 
         // Zero the whole output once, up front (was per-token before).
         std::fill(output, output + (size_t)M * (size_t)hidden, 0.f);
@@ -437,6 +524,176 @@ public:
         });
     }
 
+    // N-parallel forward_many (used when wt::kNParallel). Splits each active
+    // expert's gate/up GEMV over chunks of the `inter` row dimension and the down
+    // GEMV over chunks of `hidden`, so one token's big GEMV fans out across the
+    // whole NUMA pool instead of a single worker thread (ktransformers
+    // `split_range_n` technique). Race-free: every job writes disjoint N-slices.
+    void forward_many_nsliced(int M, int k,
+                              const uint32_t* expert_ids, const float* weights,
+                              const uint16_t* input, float* output) {
+        const int hidden = cfg_.hidden_size;
+        const int inter = cfg_.intermediate_size;
+        const int nel = cfg_.expert_num;
+        const int groupN = cfg_.groupN;
+        const int groupK = cfg_.groupK;
+        const size_t NASS = (size_t)M * (size_t)k;
+        if (M <= 0 || k <= 0 || inter <= 0 || hidden <= 0) return;
+
+        std::fill(output, output + (size_t)M * (size_t)hidden, 0.f);
+
+        // Per-expert instance bookkeeping (persistent exp_/active_/inst_idx_
+        // members re-used every call). An "instance" = one (token, rank)
+        // assignment routing to an expert. Instances of one expert are gathered
+        // into CONTIGUOUS rows so each batched matmul runs M>1 (decode a weight
+        // row once, amortize over me slots + M-way ILP — ktransformers
+        // 4-token block).
+        exp_.resize((size_t)nel);
+        active_.clear();
+        count_.assign((size_t)nel, 0);
+        inst_idx_.assign(NASS, (size_t)0);
+        for (size_t ai = 0; ai < NASS; ++ai) {
+            uint32_t eid = expert_ids[ai];
+            if (eid < (uint32_t)nel && weights[ai] != 0.f) count_[eid]++;
+        }
+        for (int e = 0; e < nel; ++e)
+            if (count_[e]) { exp_[e].ai_list.clear(); exp_[e].ai_list.reserve(count_[e]); active_.push_back(e); }
+        for (size_t ai = 0; ai < NASS; ++ai) {
+            uint32_t eid = expert_ids[ai];
+            if (eid < (uint32_t)nel && weights[ai] != 0.f) {
+                inst_idx_[ai] = exp_[eid].ai_list.size();
+                exp_[eid].ai_list.push_back(ai);
+            }
+        }
+        if (active_.empty()) return;
+
+        // Gather contiguous per-expert input rows and size the output buffers.
+        // resize() only grows capacity; steady state reuses it (no allocation).
+        for (int e : active_) {
+            ExpBuf& g = exp_[e];
+            size_t me = g.ai_list.size();
+            g.xg.resize(me * (size_t)hidden);
+            g.both.resize(me * (size_t)2 * (size_t)inter);
+            g.act.resize(me * (size_t)inter);
+            g.abf16.resize(me * (size_t)inter);
+            g.down.resize(me * (size_t)hidden);
+            for (size_t m = 0; m < me; ++m) {
+                size_t t = g.ai_list[m] / (size_t)k;
+                std::memcpy(g.xg.data() + m * (size_t)hidden, input + t * (size_t)hidden,
+                            (size_t)hidden * sizeof(uint16_t));
+            }
+        }
+        const size_t na = active_.size();
+
+        // Number of N-chunks per active expert (~4x jobs/thread, coarse ~128 rows).
+        int nc_gu = 1;
+        if (pool_.nthreads() > 1) {
+            size_t need = (pool_.nthreads() * 4) / std::max<size_t>(1, na);
+            size_t maxc = (size_t)(inter / 128);
+            if (maxc < 1) maxc = 1;
+            if (need > maxc) need = maxc;
+            if (need < 1) need = 1;
+            nc_gu = (int)need;
+        }
+        int nc_d = 1;
+        if (pool_.nthreads() > 1) {
+            size_t need = (pool_.nthreads() * 4) / std::max<size_t>(1, na);
+            size_t maxc = (size_t)(hidden / 128);
+            if (maxc < 1) maxc = 1;
+            if (need > maxc) need = maxc;
+            if (need < 1) need = 1;
+            nc_d = (int)need;
+        }
+
+        // Flattened job index for A2/B0 = sum over active experts of me*nc_gu.
+        exp_off_.resize(na + 1);
+        exp_off_[0] = 0;
+        for (size_t e_idx = 0; e_idx < na; ++e_idx)
+            exp_off_[e_idx + 1] = exp_off_[e_idx] + exp_[active_[e_idx]].ai_list.size() * (size_t)nc_gu;
+        const size_t a2_total = exp_off_[na];
+
+        // Phase A: batched gate+up slices, parallel over (expert, inter-chunk).
+        pool_.parallel_for(active_.size() * (size_t)nc_gu, [&](size_t ji) {
+            size_t e_idx = ji / (size_t)nc_gu;
+            int c = (int)(ji % (size_t)nc_gu);
+            int eid = active_[e_idx];
+            ExpBuf& g = exp_[eid];
+            int n0 = c * inter / nc_gu;
+            int n1 = (c + 1) * inter / nc_gu;
+            if (n1 > inter) n1 = inter;
+            if (n0 >= n1) return;
+            wt::gate_up_slice_batched((int)g.ai_list.size(), g.xg.data(), w13_, w13_g_, w13_gs_,
+                                      g.both.data(), inter, hidden, (size_t)eid, groupN, groupK, n0, n1);
+        });
+
+        // Phase A2: gated-SiLU -> act, parallel over (expert, instance, chunk).
+        pool_.parallel_for(a2_total, [&](size_t ji) {
+            size_t e_idx = (size_t)(std::upper_bound(exp_off_.begin(), exp_off_.end(), ji)
+                                    - exp_off_.begin()) - 1;
+            int eid = active_[e_idx];
+            ExpBuf& g = exp_[eid];
+            size_t rem = ji - exp_off_[e_idx];
+            size_t m = rem / (size_t)nc_gu;
+            int c = (int)(rem % (size_t)nc_gu);
+            int n0 = c * inter / nc_gu;
+            int n1 = (c + 1) * inter / nc_gu;
+            if (n1 > inter) n1 = inter;
+            if (n0 >= n1) return;
+            const float* b = g.both.data() + m * (size_t)2 * (size_t)inter;
+            float* a = g.act.data() + m * (size_t)inter;
+            for (int i = n0; i < n1; ++i) {
+                float gv = b[i];
+                a[i] = b[inter + i] * (gv / (1.f + std::exp(-gv)));
+            }
+        });
+
+        // Phase B0: f32 act -> bf16, parallel over (expert, instance, chunk).
+        pool_.parallel_for(a2_total, [&](size_t ji) {
+            size_t e_idx = (size_t)(std::upper_bound(exp_off_.begin(), exp_off_.end(), ji)
+                                    - exp_off_.begin()) - 1;
+            int eid = active_[e_idx];
+            ExpBuf& g = exp_[eid];
+            size_t rem = ji - exp_off_[e_idx];
+            size_t m = rem / (size_t)nc_gu;
+            int c = (int)(rem % (size_t)nc_gu);
+            int n0 = c * inter / nc_gu;
+            int n1 = (c + 1) * inter / nc_gu;
+            if (n1 > inter) n1 = inter;
+            if (n0 >= n1) return;
+            const float* a = g.act.data() + m * (size_t)inter;
+            uint16_t* ab = g.abf16.data() + m * (size_t)inter;
+            for (int i = n0; i < n1; ++i)
+                ab[i] = bf16::fp32_to_bf16(a[i]);
+        });
+
+        // Phase B: batched down slices, parallel over (expert, h-chunk).
+        pool_.parallel_for(active_.size() * (size_t)nc_d, [&](size_t ji) {
+            size_t e_idx = ji / (size_t)nc_d;
+            int c = (int)(ji % (size_t)nc_d);
+            int eid = active_[e_idx];
+            ExpBuf& g = exp_[eid];
+            int n0 = c * hidden / nc_d;
+            int n1 = (c + 1) * hidden / nc_d;
+            if (n1 > hidden) n1 = hidden;
+            if (n0 >= n1) return;
+            wt::down_slice_batched((int)g.ai_list.size(), g.abf16.data(), w2_, w2_g_, w2_gs_,
+                                   g.down.data(), hidden, inter, (size_t)eid, groupN, groupK, n0, n1);
+        });
+
+        // Phase C: weighted reduce per token (rank order) - no output contention.
+        pool_.parallel_for((size_t)M, [&](size_t t) {
+            float* out_t = output + t * (size_t)hidden;
+            for (int r = 0; r < k; ++r) {
+                size_t ai = t * (size_t)k + r;
+                uint32_t eid = expert_ids[ai];
+                float w = weights[ai];
+                if (eid >= (uint32_t)nel || w == 0.f) continue;
+                const float* d = exp_[eid].down.data() + inst_idx_[ai] * (size_t)hidden;
+                for (int h = 0; h < hidden; ++h) out_t[h] += w * d[h];
+            }
+        });
+    }
+
     // forward_one: single token, single routed expert (for warm-up / tests).
     void forward_one(uint32_t expert_id, float weight,
                      const uint16_t* x, float* out) {
@@ -467,9 +724,28 @@ private:
     // Guarded by mtx_ so accidental concurrent forward_many on the same engine is
     // safe (the fork processes layers sequentially; concurrent calls are serialized).
     mutable std::mutex mtx_;
+    // Persistent per-expert scratch for the N-parallel batched path. Defeats the
+    // per-forward malloc churn of locals: capacities persist across calls, so
+    // the steady-state hot loop does zero allocation (the prior local-vector
+    // version regressed ~25% because it mmap/munmap'd every buffer every call).
+    struct ExpBuf {
+        std::vector<uint16_t> xg, abf16;   // me*hidden / me*inter (bf16 rows)
+        std::vector<float>    both, act, down;  // me*2*inter / me*inter / me*hidden
+        std::vector<size_t>   ai_list;
+    };
+    mutable std::vector<ExpBuf> exp_;       // sized to nel; only active experts used
+    mutable std::vector<int> active_;       // reusable list of active expert ids
+    mutable std::vector<size_t> count_;     // per-expert instance counts
+    mutable std::vector<size_t> inst_idx_;  // ai -> instance rank within its expert
+    mutable std::vector<size_t> exp_off_;   // prefix sums for A2/B0 job mapping
     std::vector<float> act_scratch_;
     std::vector<float> down_scratch_;
-    NumaWorkPool pool_;
+    std::vector<float> both_scratch_;          // N-parallel gate+up (2*inter/assign)
+    std::vector<uint16_t> act_bf16_scratch_;   // N-parallel bf16 activation
+    // Shared process-wide NUMA pool (one pool for ALL layers, mirroring lk_moe's
+    // single Backend_NUMA engine). Per-layer pools would give ~61 x threads and
+    // thrash the scheduler; a single pool keeps the total = XIAOTU_MOE_THREADS.
+    NumaWorkPool& pool_;
 };
 
 } // namespace xiaotu_moe

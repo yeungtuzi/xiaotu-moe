@@ -102,6 +102,12 @@ inline void matmul_fp8_quant(const uint16_t* A, const uint8_t* W, const float* S
 
 // FP8 WeightTraits. Base class dispatches to *_impl via CRTP (see moe_v2.hpp).
 struct FP8WeightTraits : WeightTraitsBase<FP8WeightTraits> {
+    static constexpr size_t w13_bytes_impl(size_t E, size_t n2, size_t H) {
+        return E * n2 * H * sizeof(uint8_t);  // [E][2I][H] fp8
+    }
+    static constexpr size_t w2_bytes_impl(size_t E, size_t H, size_t I) {
+        return E * H * I * sizeof(uint8_t);   // [E][H][I] fp8
+    }
     static void gate_up_impl(const uint16_t* x, const void* w13, const void* w13_g,
                             const float* w13_gs, float* gate, float* up,
                             int inter, int hidden, size_t eid,
