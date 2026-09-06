@@ -80,6 +80,35 @@ PYTHON=$(which python) bash scripts/build.sh   # 构建 avx512_bf16（或最佳�
 1. **专家归组** — `forward_many` 按活跃专家各走一次（自适应 grouped vs 逐 token 派发）。**诚实的实测结论：无提速**——每次 gate_up/down 仍按 assignment 读整块 12MB 专家块（块≫L2，跨 assignment 不缓存），所以仅归组并未真正降 DRAM 流量。真正"每块只读一次"需分块/批量 GEMM + register blocking，留作 future work。
 2. **Backend_NUMA 等价物** — `csrc/moe/numa_pool.hpp`（`NumaWorkPool`）：持久线程池 + NUMA 节点亲和（每个 worker 用 `sched_setaffinity` 钉到不同物理核、跨 NUMA 节点轮转）+ 动态工作窃取 + 对引擎独占的权重快照缓冲做 NUMA 交织内存（raw `mbind` syscall，**不依赖 libnuma**；开源参考：Apache-2.0 的 ktransformers `backend_numa.cpp`）。其完成屏障已改为逐 worker generation 记录，消除跨代竞态。
 
+## 性能（v0.12）
+
+**2.2× 突破**：用 fork 的 vLLM 配 `--compilation_config.cudagraph_mode FULL_DECODE_ONLY`
+消除了跨 43 个 CPU MoE 层每步解码的宿主 GPU 内核启动/同步编排。该配置与生产版 lk
+服务器一致，是真正的提速杠杆（线程数只是次要因素）。
+
+基准：**DeepSeek-V4-Flash-0731**（43 个 MoE 层全部走 xiaotu CPU 引擎），ShareGPT
+**50 prompts / 并发 4 / max-model-len 8192**，双路 EPYC 9654（192 物理核，SMT 关闭）
++ A100/GPU2（tensor-parallel-size 1）。
+
+| 配置 | 总吞吐 (tok/s) | 中位 TPOT (ms) | 50/50 |
+|---|---:|---:|---:|
+| v0.11 基线（168，cudagraph NONE） | 25.95 | 293.6 | 50/0 |
+| **v0.12 @ 168（84/路 · 7/CCD，指定）** | **66.62** | **79.83** | 50/0 |
+| v0.12 @ 120（5/CCD 指南） | 77.69 | 73.65 | 50/0 |
+| v0.12 @ 96 | 77.75 | 67.29 | 50/0 |
+
+> MoE 解码是**内存带宽受限**：每路 IOD DDR5 带宽是硬上限。**4 核/CCD 已达峰值**；
+> 仅当内存带宽更高（如主板把 DDR5 跑到 5600）才**上 5 核/CCD**；切勿超过 5 核/CCD。
+> 详细"为什么 96≈120 > 168"的分析见 [`xiaotu-moe/docs/THREAD_GEOMETRY.md`](xiaotu-moe/docs/THREAD_GEOMETRY.md)。
+
+## 已知问题
+
+| 优先级 | 问题 | 状态 |
+|---:|---|---|
+| 🔴 高 | **原生模式内存占用过高**：未裁剪时真实大模型进程峰值 VmRSS 可达 **~554 GB**，远超 ~155 GB 权重工作集与 lk 参考的 256 GB；解码期"只增不减"持续增长（~24 GB/min）。**正在修复（目标 ≤256 GB）**。 | 调查中 |
+| 🟡 中 | WNA16（FP8）路径存在既有 `packed4` 打包 bug（flat 与 sharded 均失败）——非主打格式，不影响真实 BF16/MXFP4 推理。 | 已知 |
+| 🟡 中 | MXFP4 sharded 池偶发竞态（E=2 H=512 合成形状）——既有问题，与融合/线程/cudagraph 无关，从未影响 50/50 真实基准。 | 已知 |
+
 ## 作者
 
 **大河马（dahema@me.com）** · **由 DeepSeek Harness 辅助**。

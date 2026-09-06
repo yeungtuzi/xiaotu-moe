@@ -119,6 +119,38 @@ report](xiaotu-moe/docs/XIAOTU_MOE_REPORT_en.md)):
    hardened with per-worker generation records to eliminate a cross-generation
    race.
 
+## Performance (v0.12)
+
+**2.2× breakthrough** — running the fork's vLLM with
+`--compilation_config.cudagraph_mode FULL_DECODE_ONLY` removes the
+per-decode-step host GPU-kernel launch/sync orchestration across the 43 CPU MoE
+layers. This matches the production lk server's own config, and is the real
+speeeed lever (thread count is secondary).
+
+Benchmark: **DeepSeek-V4-Flash-0731** (all 43 MoE layers on the xiaotu CPU
+engine), ShareGPT **50 prompts / concurrency 4 / max-model-len 8192**, dual-socket
+EPYC 9654 (192 physical cores, SMT OFF) + A100/GPU2 (tensor-parallel-size 1).
+
+| Config | Total (tok/s) | Med TPOT (ms) | 50/50 |
+|---|---:|---:|---:|
+| v0.11 baseline (168, cudagraph NONE) | 25.95 | 293.6 | 50/0 |
+| **v0.12 @ 168 (84/socket · 7/CCD, mandated)** | **66.62** | **79.83** | 50/0 |
+| v0.12 @ 120 (5/CCD guide) | 77.69 | 73.65 | 50/0 |
+| v0.12 @ 96 | 77.75 | 67.29 | 50/0 |
+
+> MoE decode is **memory-bandwidth-bound**: per-socket IOD DDR5 bandwidth is the
+> hard ceiling. **4 cores/CCD already reaches the peak**; go to **5/CCD only if**
+> memory bandwidth is higher (e.g. board runs DDR5-5600); never past 5/CCD. Full
+> why-analysis: [`xiaotu-moe/docs/THREAD_GEOMETRY.md`](xiaotu-moe/docs/THREAD_GEOMETRY.md).
+
+## Known issues
+
+| Priority | Issue | Status |
+|---:|---|---|
+| 🔴 High | **Native-mode memory footprint** — peak VmRSS up to **~554 GB** on the real large model in untrimmed runs, far above the ~155 GB weight working set and the 256 GB lk reference; decode-phase "only grows" accumulation (~24 GB/min). **Under active fix (target ≤256 GB).** | Investigating |
+| 🟡 Med | WNA16 (FP8) path has a pre-existing `packed4` packing bug (flat & sharded both fail) — not a shipping format, does not affect real BF16/MXFP4 inference. | Known |
+| 🟡 Med | MXFP4 sharded pool occasional race (E=2 H=512 synthetic) — pre-existing, unrelated to fusion/threads/cudagraph, never hit the 50/50 real bench. | Known |
+
 ## Authors
 
 **大河马 (dahema@me.com)** · assisted by **DeepSeek Harness**.
