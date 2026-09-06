@@ -22,6 +22,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <sys/mman.h>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -324,26 +326,93 @@ public:
         const size_t w2_bytes = WeightTraits::w2_bytes(E, H, I);
         const size_t w13g_bytes = (size_t)E * ((n2 + gn - 1) / gn) * ((H + gk - 1) / gk) * (e8m0 ? 1u : sizeof(float));
         const size_t w2g_bytes = (size_t)E * ((H + gn - 1) / gn) * ((I + gk - 1) / gk) * (e8m0 ? 1u : sizeof(float));
-        // NUMA-align the big weight snapshots: the MoE is bandwidth-bound and the
-        // pool spans both sockets (84 threads each). Default allocation lands on
-        // the constructor's node, so half the workers would read remote DRAM at
-        // ~half bandwidth. Set the thread policy to INTERLEAVE for these
-        // allocations (pages fault in already interleaved), then restore default.
-        if (w13) { buf_w13_ = std::make_unique<uint8_t[]>(w13_bytes); std::memcpy(buf_w13_.get(), w13, w13_bytes); w13_ = buf_w13_.get(); }
-        else     { w13_ = nullptr; }
-        if (w2)  { buf_w2_ = std::make_unique<uint8_t[]>(w2_bytes); std::memcpy(buf_w2_.get(), w2, w2_bytes); w2_ = buf_w2_.get(); }
-        else     { w2_ = nullptr; }
-        if (w13_g) { buf_w13_g_ = std::make_unique<uint8_t[]>(w13g_bytes); std::memcpy(buf_w13_g_.get(), w13_g, w13g_bytes); w13_g_ = buf_w13_g_.get(); }
-        else       { w13_g_ = nullptr; } // no per-expert scale for this block
-        if (w2_g) { buf_w2_g_ = std::make_unique<uint8_t[]>(w2g_bytes); std::memcpy(buf_w2_g_.get(), w2_g, w2g_bytes); w2_g_ = buf_w2_g_.get(); }
-        else       { w2_g_ = nullptr; } // no per-expert scale for this block
-        // global scales are tiny; copy if provided
+        // SINGLE-COPY NUMA SHARDING (new default for the N-parallel packed4 path).
+        // The MoE re-reads the ~GB-scale weight blocks every decode step. Two
+        // competing designs place those reads physically local to each core:
+        //   (a) per-SOCKET replication (old): 2 socket copies, each worker reads
+        //       its local copy -> weights read TWICE total, 2x memory.
+        //   (b) single-copy sharding (here): split rows across ALL NUMA nodes;
+        //       node n owns gate [n*I/NS,(n+1)*I/NS) & down [n*H/NS,(n+1)*H/NS).
+        //       Each core reads ONLY its node's rows, all page-local; weights are
+        //       read ONCE total, memory = 1 copy. Scales stay as one small full
+        //       copy (indexed by absolute row). Env XIAOTU_MOE_NOSHARD=1 forces the
+        //       old socket-replica path (A/B toggling). Falls back to socket
+        //       replication then single copy on failure / non-divisible dims.
+        // lk-moe-parity SINGLE-COPY mode (env XIAOTU_MOE_SINGLECOPY=1): hold the
+        // model exactly ONCE (one contiguous snapshot into buf_w13_/buf_w2_), with
+        // NO NUMA shard regions and NO per-socket replicas. This matches the
+        // reference lk engine's footprint (~model size ~160G) instead of the
+        // ~157G + ~136G shard copy (~300G). The MoE weight-read phase (A/B) is not
+        // the conc-4 binding constraint (see results SESSION7), so the redundant
+        // shard copy is pure memory overhead here.
+        const bool single_copy =
+            std::getenv("XIAOTU_MOE_SINGLECOPY") != nullptr;
+        bool sharded_ok = false;
+        if constexpr (wt::kNParallel) {
+            if (single_copy) {
+                nshard_ = 0;  // skip shard + socket-replica; else-branch copies once
+            } else if (std::getenv("XIAOTU_MOE_NOSHARD") == nullptr) {
+                nshard_ = numa_node_count();
+                const int NS = nshard_;
+                if (NS >= 2 && (I % NS == 0) && (H % NS == 0)) {
+                    w13_shard_.assign((size_t)NS, nullptr);
+                    w2_shard_.assign((size_t)NS, nullptr);
+                    sharded_ok = shard_fill_w13(w13) && shard_fill_w2(w2);
+                    if (sharded_ok) {
+                        // scales: single full copy (tiny, indexed by absolute row j).
+                        if (w13_g) { buf_w13_g_ = std::make_unique<uint8_t[]>(w13g_bytes); std::memcpy(buf_w13_g_.get(), w13_g, w13g_bytes); w13_g_ = buf_w13_g_.get(); }
+                        else       { w13_g_ = nullptr; }
+                        if (w2_g) { buf_w2_g_ = std::make_unique<uint8_t[]>(w2g_bytes); std::memcpy(buf_w2_g_.get(), w2_g, w2g_bytes); w2_g_ = buf_w2_g_.get(); }
+                        else       { w2_g_ = nullptr; }
+                        // node-0 shard referenced for debug/parity + any fallback
+                        w13_ = w13_shard_[0];  w2_ = w2_shard_[0];
+                    } else {
+                        nshard_ = 0; w13_shard_.clear(); w2_shard_.clear();
+                    }
+                } else {
+                    nshard_ = 0;
+                }
+            }
+            if (!sharded_ok && !single_copy) {
+                // legacy per-socket replication (or single copy if it fails).
+                nsock_ = numa_socket_count();
+                sock_fill(w13, w13_bytes, sock_owned_, w13_s_);
+                sock_fill(w2, w2_bytes, sock_owned_, w2_s_);
+                sock_fill(w13_g, w13g_bytes, sock_owned_, w13g_s_);
+                sock_fill(w2_g, w2g_bytes, sock_owned_, w2g_s_);
+            }
+        }
+        if (sharded_ok) {
+            // w13_/w2_/scales already set above (single-copy sharded mode).
+        } else if (nsock_ >= 2) {
+            // Replicas REPLACE the single copy. w13_/w2_ reference the socket-0
+            // replica so debug/parity accessors and any single-threaded fallback
+            // still see valid memory.
+            w13_ = w13_s_[0];   w2_ = w2_s_[0];
+            w13_g_ = w13g_s_[0]; w2_g_ = w2g_s_[0];
+        } else {
+            // single socket / replication not possible: one contiguous copy.
+            if (w13) { buf_w13_ = std::make_unique<uint8_t[]>(w13_bytes); std::memcpy(buf_w13_.get(), w13, w13_bytes); w13_ = buf_w13_.get(); }
+            else     { w13_ = nullptr; }
+            if (w2)  { buf_w2_ = std::make_unique<uint8_t[]>(w2_bytes); std::memcpy(buf_w2_.get(), w2, w2_bytes); w2_ = buf_w2_.get(); }
+            else     { w2_ = nullptr; }
+            if (w13_g) { buf_w13_g_ = std::make_unique<uint8_t[]>(w13g_bytes); std::memcpy(buf_w13_g_.get(), w13_g, w13g_bytes); w13_g_ = buf_w13_g_.get(); }
+            else       { w13_g_ = nullptr; } // no per-expert scale for this block
+            if (w2_g) { buf_w2_g_ = std::make_unique<uint8_t[]>(w2g_bytes); std::memcpy(buf_w2_g_.get(), w2_g, w2g_bytes); w2_g_ = buf_w2_g_.get(); }
+            else       { w2_g_ = nullptr; } // no per-expert scale for this block
+        }
+        // global scales are tiny; copy if provided (shared across sockets)
         if (w13_gs) { buf_w13_gs_ = std::make_unique<float[]>(E); std::memcpy(buf_w13_gs_.get(), w13_gs, E * sizeof(float)); w13_gs_ = buf_w13_gs_.get(); }
         else        { w13_gs_ = nullptr; }
         if (w2_gs) { buf_w2_gs_ = std::make_unique<float[]>(E); std::memcpy(buf_w2_gs_.get(), w2_gs, E * sizeof(float)); w2_gs_ = buf_w2_gs_.get(); }
         else       { w2_gs_ = nullptr; }
 
         if (!w13_ || !w2_) throw std::runtime_error("MOE_V2: null w13/w2");
+    }
+
+    ~MOE_V2() {
+        for (void* p : sock_owned_) munmap(p, 0);
+        for (void* p : shard_owned_) munmap(p, 0);
     }
 
     // forward_many: M tokens, top_k=k. expert_ids/weights are [M][k] row-major.
@@ -539,6 +608,7 @@ public:
         const int groupK = cfg_.groupK;
         const size_t NASS = (size_t)M * (size_t)k;
         if (M <= 0 || k <= 0 || inter <= 0 || hidden <= 0) return;
+        prof_init();
 
         std::fill(output, output + (size_t)M * (size_t)hidden, 0.f);
 
@@ -587,22 +657,53 @@ public:
 
         // Number of N-chunks per active expert (~4x jobs/thread, coarse ~128 rows).
         int nc_gu = 1;
-        if (pool_.nthreads() > 1) {
-            size_t need = (pool_.nthreads() * 4) / std::max<size_t>(1, na);
-            size_t maxc = (size_t)(inter / 128);
-            if (maxc < 1) maxc = 1;
-            if (need > maxc) need = maxc;
-            if (need < 1) need = 1;
-            nc_gu = (int)need;
+        {   const char* eov = std::getenv("XIAOTU_MOE_NCGU");
+            if (eov && std::atoi(eov) > 0) nc_gu = std::atoi(eov);
+            else if (pool_.nthreads() > 1) {
+                size_t need = (pool_.nthreads() * 4) / std::max<size_t>(1, na);
+                size_t maxc = (size_t)(inter / 128);
+                if (maxc < 1) maxc = 1;
+                if (need > maxc) need = maxc;
+                if (need < 1) need = 1;
+                nc_gu = (int)need;
+            }
         }
         int nc_d = 1;
-        if (pool_.nthreads() > 1) {
-            size_t need = (pool_.nthreads() * 4) / std::max<size_t>(1, na);
-            size_t maxc = (size_t)(hidden / 128);
-            if (maxc < 1) maxc = 1;
-            if (need > maxc) need = maxc;
-            if (need < 1) need = 1;
-            nc_d = (int)need;
+        {   const char* eov = std::getenv("XIAOTU_MOE_NCD");
+            if (eov && std::atoi(eov) > 0) nc_d = std::atoi(eov);
+            else if (pool_.nthreads() > 1) {
+                size_t need = (pool_.nthreads() * 4) / std::max<size_t>(1, na);
+                size_t maxc = (size_t)(hidden / 128);
+                if (maxc < 1) maxc = 1;
+                if (need > maxc) need = maxc;
+                if (need < 1) need = 1;
+                nc_d = (int)need;
+            }
+        }
+
+        // Sub-split for the SHARDED weight-read phases (A and B). Unlike the flat
+        // path (nc_gu/nc_d chunks), the sharded path launches exactly `na` jobs per
+        // node -- na*NS total (e.g. 6*8=48) -- so each node's ~nthreads/NS workers
+        // (168/8=21) have only 6 tickets and ~15 of them sit idle during the
+        // bandwidth-critical w13/w2 reads. Sub-splitting each node's row span into
+        // ~threads-per-node tickets engages ALL worker threads on its node-local
+        // shard. Env XIAOTU_MOE_SHARDSPLIT=N forces sub; =0 disables (A/B toggle);
+        // default picks ceil(tpn/na) capped to keep >=32 rows/job.
+        int subA = 1, subB = 1;
+        {
+            const char* eov = std::getenv("XIAOTU_MOE_SHARDSPLIT");
+            if (eov && std::atoi(eov) > 0) { subA = std::atoi(eov); subB = subA; }
+            else if (nshard_ >= 2 && pool_.nthreads() > 1 && (!eov || std::atoi(eov) < 0)) {
+                const int NS = nshard_;
+                size_t tpn = std::max<size_t>(1, pool_.nthreads() / (size_t)NS);
+                size_t need = (tpn + na - 1) / na;                    // ceil(tpn/na)
+                size_t spanA = (size_t)(inter / NS);
+                subA = (int)std::min<size_t>(need, std::max<size_t>(1, spanA / 32));
+                if (subA < 1) subA = 1;
+                size_t spanB = (size_t)(hidden / NS);
+                subB = (int)std::min<size_t>(need, std::max<size_t>(1, spanB / 32));
+                if (subB < 1) subB = 1;
+            }
         }
 
         // Flattened job index for A2/B0 = sum over active experts of me*nc_gu.
@@ -612,73 +713,121 @@ public:
             exp_off_[e_idx + 1] = exp_off_[e_idx] + exp_[active_[e_idx]].ai_list.size() * (size_t)nc_gu;
         const size_t a2_total = exp_off_[na];
 
-        // Phase A: batched gate+up slices, parallel over (expert, inter-chunk).
-        pool_.parallel_for(active_.size() * (size_t)nc_gu, [&](size_t ji) {
-            size_t e_idx = ji / (size_t)nc_gu;
-            int c = (int)(ji % (size_t)nc_gu);
-            int eid = active_[e_idx];
-            ExpBuf& g = exp_[eid];
-            int n0 = c * inter / nc_gu;
-            int n1 = (c + 1) * inter / nc_gu;
-            if (n1 > inter) n1 = inter;
-            if (n0 >= n1) return;
-            wt::gate_up_slice_batched((int)g.ai_list.size(), g.xg.data(), w13_, w13_g_, w13_gs_,
-                                      g.both.data(), inter, hidden, (size_t)eid, groupN, groupK, n0, n1);
-        });
+        using clk = std::chrono::steady_clock;
+        auto pA0 = clk::now();
+        // Phase A: batched gate+up slices. Sharded: each NUMA node computes the
+        // rows it owns ([n*I/NS,(n+1)*I/NS)) for EVERY active expert, reading its
+        // node-local shard (na jobs per node). Otherwise the legacy flat path
+        // splits (expert, inter-chunk) and reads the worker's socket replica.
+        if (nshard_ >= 2) {
+            const size_t NS = (size_t)nshard_;
+            std::vector<size_t> jc(NS, (size_t)active_.size() * (size_t)subA);
+            pool_.parallel_for_sharded((int)NS, jc.data(), [&](size_t n, size_t job) {
+                size_t e_idx = job / (size_t)subA;
+                size_t s = job % (size_t)subA;
+                if (e_idx >= active_.size()) return;
+                int eid = active_[e_idx];
+                ExpBuf& g = exp_[eid];
+                const size_t me = g.ai_list.size();
+                if (me == 0) return;
+                int n0 = (int)(n * inter / NS);
+                int n1 = (int)((n + 1) * inter / NS);
+                if (n1 > inter) n1 = inter;
+                if (n0 >= n1) return;
+                if (subA > 1) {           // sub-split node span across node's threads
+                    int sep = (n1 - n0 + subA - 1) / subA;
+                    n0 = n0 + (int)s * sep;
+                    n1 = std::min<int>(n1, n0 + sep);
+                    if (n0 >= n1) return;
+                }
+                wt::gate_up_slice_batched((int)me, g.xg.data(), w13_shard_[n], w13_g_, w13_gs_,
+                                          g.both.data(), inter, hidden, (size_t)eid, groupN, groupK, n0, n1);
+                // FUSED (lk does 3 barriers, we now do 3): gated-SiLU + f32->bf16
+                // applied inline on this node's chunk for every instance, replacing
+                // the former separate A2/B0 global barriers. Identical numerics.
+                const float* bc = g.both.data();
+                uint16_t* ab = g.abf16.data();
+                for (size_t mi = 0; mi < me; ++mi) {
+                    const float* bs = bc + mi * (size_t)2 * (size_t)inter;
+                    uint16_t* abd = ab + mi * (size_t)inter;
+                    for (int i = n0; i < n1; ++i) {
+                        float gv = bs[i];
+                        abd[i] = bf16::fp32_to_bf16(bs[inter + i] * (gv / (1.f + std::exp(-gv))));
+                    }
+                }
+            });
+        } else {
+            pool_.parallel_for(active_.size() * (size_t)nc_gu, [&](size_t ji) {
+                size_t e_idx = ji / (size_t)nc_gu;
+                int c = (int)(ji % (size_t)nc_gu);
+                int eid = active_[e_idx];
+                ExpBuf& g = exp_[eid];
+                const size_t me = g.ai_list.size();
+                int n0 = c * inter / nc_gu;
+                int n1 = (c + 1) * inter / nc_gu;
+                if (n1 > inter) n1 = inter;
+                if (n0 >= n1) return;
+                const int s = xiaotu_moe::current_socket();   // worker's pinned socket
+                wt::gate_up_slice_batched((int)me, g.xg.data(), w13_for(s), w13g_for(s), w13_gs_,
+                                          g.both.data(), inter, hidden, (size_t)eid, groupN, groupK, n0, n1);
+                // FUSED gated-SiLU + f32->bf16 (lk-style single phase), replacing A2/B0.
+                const float* bc = g.both.data();
+                uint16_t* ab = g.abf16.data();
+                for (size_t mi = 0; mi < me; ++mi) {
+                    const float* bs = bc + mi * (size_t)2 * (size_t)inter;
+                    uint16_t* abd = ab + mi * (size_t)inter;
+                    for (int i = n0; i < n1; ++i) {
+                        float gv = bs[i];
+                        abd[i] = bf16::fp32_to_bf16(bs[inter + i] * (gv / (1.f + std::exp(-gv))));
+                    }
+                }
+            });
+        }
+        auto pA1 = clk::now();
 
-        // Phase A2: gated-SiLU -> act, parallel over (expert, instance, chunk).
-        pool_.parallel_for(a2_total, [&](size_t ji) {
-            size_t e_idx = (size_t)(std::upper_bound(exp_off_.begin(), exp_off_.end(), ji)
-                                    - exp_off_.begin()) - 1;
-            int eid = active_[e_idx];
-            ExpBuf& g = exp_[eid];
-            size_t rem = ji - exp_off_[e_idx];
-            size_t m = rem / (size_t)nc_gu;
-            int c = (int)(rem % (size_t)nc_gu);
-            int n0 = c * inter / nc_gu;
-            int n1 = (c + 1) * inter / nc_gu;
-            if (n1 > inter) n1 = inter;
-            if (n0 >= n1) return;
-            const float* b = g.both.data() + m * (size_t)2 * (size_t)inter;
-            float* a = g.act.data() + m * (size_t)inter;
-            for (int i = n0; i < n1; ++i) {
-                float gv = b[i];
-                a[i] = b[inter + i] * (gv / (1.f + std::exp(-gv)));
-            }
-        });
-
-        // Phase B0: f32 act -> bf16, parallel over (expert, instance, chunk).
-        pool_.parallel_for(a2_total, [&](size_t ji) {
-            size_t e_idx = (size_t)(std::upper_bound(exp_off_.begin(), exp_off_.end(), ji)
-                                    - exp_off_.begin()) - 1;
-            int eid = active_[e_idx];
-            ExpBuf& g = exp_[eid];
-            size_t rem = ji - exp_off_[e_idx];
-            size_t m = rem / (size_t)nc_gu;
-            int c = (int)(rem % (size_t)nc_gu);
-            int n0 = c * inter / nc_gu;
-            int n1 = (c + 1) * inter / nc_gu;
-            if (n1 > inter) n1 = inter;
-            if (n0 >= n1) return;
-            const float* a = g.act.data() + m * (size_t)inter;
-            uint16_t* ab = g.abf16.data() + m * (size_t)inter;
-            for (int i = n0; i < n1; ++i)
-                ab[i] = bf16::fp32_to_bf16(a[i]);
-        });
-
-        // Phase B: batched down slices, parallel over (expert, h-chunk).
-        pool_.parallel_for(active_.size() * (size_t)nc_d, [&](size_t ji) {
-            size_t e_idx = ji / (size_t)nc_d;
-            int c = (int)(ji % (size_t)nc_d);
-            int eid = active_[e_idx];
-            ExpBuf& g = exp_[eid];
-            int n0 = c * hidden / nc_d;
-            int n1 = (c + 1) * hidden / nc_d;
-            if (n1 > hidden) n1 = hidden;
-            if (n0 >= n1) return;
-            wt::down_slice_batched((int)g.ai_list.size(), g.abf16.data(), w2_, w2_g_, w2_gs_,
-                                   g.down.data(), hidden, inter, (size_t)eid, groupN, groupK, n0, n1);
-        });
+        // Phase B: batched down slices. Sharded: node n computes down rows
+        // [n*H/NS,(n+1)*H/NS) for every active expert from its node-local shard.
+        // Otherwise flat (expert, h-chunk) over the worker's socket replica.
+        if (nshard_ >= 2) {
+            const size_t NS = (size_t)nshard_;
+            std::vector<size_t> jc(NS, (size_t)active_.size() * (size_t)subB);
+            pool_.parallel_for_sharded((int)NS, jc.data(), [&](size_t n, size_t job) {
+                size_t e_idx = job / (size_t)subB;
+                size_t s = job % (size_t)subB;
+                if (e_idx >= active_.size()) return;
+                int eid = active_[e_idx];
+                ExpBuf& g = exp_[eid];
+                const size_t me = g.ai_list.size();
+                if (me == 0) return;
+                int n0 = (int)(n * hidden / NS);
+                int n1 = (int)((n + 1) * hidden / NS);
+                if (n1 > hidden) n1 = hidden;
+                if (n0 >= n1) return;
+                if (subB > 1) {           // sub-split node span across node's threads
+                    int sep = (n1 - n0 + subB - 1) / subB;
+                    n0 = n0 + (int)s * sep;
+                    n1 = std::min<int>(n1, n0 + sep);
+                    if (n0 >= n1) return;
+                }
+                wt::down_slice_batched((int)me, g.abf16.data(), w2_shard_[n], w2_g_, w2_gs_,
+                                       g.down.data(), hidden, inter, (size_t)eid, groupN, groupK, n0, n1);
+            });
+        } else {
+            pool_.parallel_for(active_.size() * (size_t)nc_d, [&](size_t ji) {
+                size_t e_idx = ji / (size_t)nc_d;
+                int c = (int)(ji % (size_t)nc_d);
+                int eid = active_[e_idx];
+                ExpBuf& g = exp_[eid];
+                int n0 = c * hidden / nc_d;
+                int n1 = (c + 1) * hidden / nc_d;
+                if (n1 > hidden) n1 = hidden;
+                if (n0 >= n1) return;
+                const int s = xiaotu_moe::current_socket();   // worker's pinned socket
+                wt::down_slice_batched((int)g.ai_list.size(), g.abf16.data(), w2_for(s), w2g_for(s), w2_gs_,
+                                       g.down.data(), hidden, inter, (size_t)eid, groupN, groupK, n0, n1);
+            });
+        }
+        auto pB1 = clk::now();
 
         // Phase C: weighted reduce per token (rank order) - no output contention.
         pool_.parallel_for((size_t)M, [&](size_t t) {
@@ -692,6 +841,13 @@ public:
                 for (int h = 0; h < hidden; ++h) out_t[h] += w * d[h];
             }
         });
+        auto pC = clk::now();
+        prof_add((size_t)M, active_.size(),
+                 std::chrono::duration_cast<std::chrono::nanoseconds>(pA1 - pA0).count(),
+                 0, 0,
+                 std::chrono::duration_cast<std::chrono::nanoseconds>(pB1 - pA1).count(),
+                 std::chrono::duration_cast<std::chrono::nanoseconds>(pC - pB1).count(),
+                 std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - pC).count());
     }
 
     // forward_one: single token, single routed expert (for warm-up / tests).
@@ -710,6 +866,13 @@ public:
     const void* debug_w13() const { return w13_; }
     const void* debug_w2() const { return w2_; }
 
+    // Per-socket accessors: return the replica for socket `s`, or the shared
+    // single copy when replication is off (nsock_<2 => w13_s_ are null).
+    const void* w13_for(int s) const { return s >= 0 && s < 2 && w13_s_[s] ? w13_s_[s] : w13_; }
+    const void* w2_for(int s)  const { return s >= 0 && s < 2 && w2_s_[s]  ? w2_s_[s]  : w2_; }
+    const void* w13g_for(int s) const { return s >= 0 && s < 2 && w13g_s_[s] ? w13g_s_[s] : w13_g_; }
+    const void* w2g_for(int s) const { return s >= 0 && s < 2 && w2g_s_[s]  ? w2g_s_[s]  : w2_g_; }
+
 private:
     MOEConfigV2 cfg_;
     std::unique_ptr<uint8_t[]> buf_w13_, buf_w2_, buf_w13_g_, buf_w2_g_;
@@ -720,6 +883,179 @@ private:
     const void* w2_g_;
     const float* w13_gs_;
     const float* w2_gs_;
+    // Per-socket weight replicas (mmap'd, munmap'd in the destructor). Used by
+    // the N-parallel packed4 hot path so each worker reads only its own socket's
+    // pages. nsock_==1 when a single socket or when replication was not possible.
+    int nsock_ = 1;
+    std::vector<void*> sock_owned_;
+    const void* w13_s_[2] = {nullptr, nullptr};
+    const void* w2_s_[2] = {nullptr, nullptr};
+    const void* w13g_s_[2] = {nullptr, nullptr};
+    const void* w2g_s_[2] = {nullptr, nullptr};
+
+    // Single-copy NUMA sharding (N-parallel path). When nshard_>=2 the two GB-scale
+    // blocks are sharded across NUMA nodes: node n owns gate rows [n*I/NS,(n+1)*I/NS)
+    // & down rows [n*H/NS,(n+1)*H/NS). Each node's region uses the FULL-layout stride
+    // (per-expert offset UNCHANGED -> existing kernel path works with rowshift==0),
+    // mmap'd and MPOL_BIND to that node, but only its OWNED rows are faulted in:
+    // unowned rows have no physical backing and are never read, so physical RSS is
+    // ONE full copy across all nodes. Every weight read is from node-local pages
+    // (no cross-node traffic): each layer's weights are read exactly ONCE over the
+    // whole machine (vs 2x with per-socket replication). Scales stay as one full
+    // copy (tiny, indexed by absolute row).
+    int nshard_ = 0;
+    std::vector<void*> shard_owned_;
+    std::vector<const uint8_t*> w13_shard_;
+    std::vector<const uint8_t*> w2_shard_;
+
+    // Lightweight per-phase timing (env-gated print). Accumulates wall time of
+    // the 5 phases across calls; prints a breakdown every prof_every_ calls.
+    bool prof_ = false;
+    size_t prof_every_ = 40;
+    size_t prof_calls_ = 0;
+    int64_t prof_A_ = 0, prof_A2_ = 0, prof_B0_ = 0, prof_B_ = 0, prof_C_ = 0, prof_ovh_ = 0;
+    size_t prof_M_ = 0, prof_na_ = 0;
+    void prof_init() {
+        prof_ = std::getenv("XIAOTU_MOE_PROFILE") != nullptr;
+        if (prof_) {
+            static bool once = [](){ fprintf(stderr, "[MOE-PROF] profiling ENABLED (XIAOTU_MOE_PROFILE set)\n"); return true; }();
+        }
+    }
+    void prof_add(size_t M, size_t na, int64_t dA, int64_t dA2, int64_t dB0,
+                  int64_t dB, int64_t dC, int64_t dovh) {
+        if (!prof_) return;
+        prof_A_ += dA; prof_A2_ += dA2; prof_B0_ += dB0; prof_B_ += dB;
+        prof_C_ += dC; prof_ovh_ += dovh; prof_M_ += M; prof_na_ += na; ++prof_calls_;
+        if (prof_calls_ % prof_every_ == 0) {
+            double S = (double)(prof_A_ + prof_A2_ + prof_B0_ + prof_B_ + prof_C_ + prof_ovh_) / 1e6;
+            double navg = (double)prof_na_ / (double)prof_calls_;
+            double mavg = (double)prof_M_ / (double)prof_calls_;
+            // routing-skew histogram over the last call's active experts
+            int maxme = 0; long b1=0,b8=0,b32=0,b128=0,bb=0;
+            for (int e : active_) {
+                int m = (int)exp_[e].ai_list.size(); maxme = std::max(maxme, m);
+                if (m<2)b1++; else if(m<8)b8++; else if(m<32)b32++; else if(m<128)b128++; else bb++;
+            }
+            fprintf(stderr,
+                "[MOE-PROF] calls=%zu na=%.0f M=%.0f maxme=%d  skew(1|2-7|8-31|32-127|128+)=%ld|%ld|%ld|%ld|%ld  A=%.1fms A2=%.1fms B0=%.1fms B=%.1fms C=%.1fms ovh=%.1fms (sum %.0fms)\n",
+                prof_calls_, navg, mavg, maxme, b1,b8,b32,b128,bb,
+                prof_A_/1e6, prof_A2_/1e6, prof_B0_/1e6,
+                prof_B_/1e6, prof_C_/1e6, prof_ovh_/1e6, S);
+            prof_A_=prof_A2_=prof_B0_=prof_B_=prof_C_=prof_ovh_=prof_M_=prof_na_=0;
+        }
+    }
+
+    // Fill one full-stride, MPOL_BIND-to-node `node` region of `total` bytes with
+    // this node's owned rows copied from `src`. `copier(d,s,per_eid_bytes)` copies
+    // the node's (stride-located) rows into the local region; writing faults the
+    // pages in on `node`, so every backed page is physically local and the total
+    // physical RSS across all nodes equals one full copy.
+    static void* shard_region(size_t total, int node,
+                              const uint8_t* src,
+                              const std::function<void(uint8_t*, const uint8_t*, size_t)>& copier) {
+        void* p = mmap(nullptr, total, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) return nullptr;
+        // Opt the region into 2MB transparent hugepages (host THP=madvise) so the
+        // streaming weight reads don't thrash the 4KB TLB. Default ON; env
+        // XIAOTU_MOE_SHARD_HUGEPAGE=0 disables (A/B toggle).
+        const char* hp = std::getenv("XIAOTU_MOE_SHARD_HUGEPAGE");
+        if (!hp || std::atoi(hp) != 0) madvise(p, total, MADV_HUGEPAGE);
+        unsigned long mask = 1UL << node;
+        long rc = syscall(SYS_set_mempolicy, MPOL_BIND, &mask, sizeof(mask) * 8);
+        uint8_t* d = static_cast<uint8_t*>(p);
+        copier(d, src, total);
+        if (rc == 0) syscall(SYS_set_mempolicy, MPOL_DEFAULT, nullptr, 0);
+        if (std::getenv("XIAOTU_MOE_SHARD_DIAG") != nullptr)
+            fprintf(stderr, "[SHARD-DIAG] region node=%d rc=%ld vmasize=%.1fGiB addr=%p%s\n",
+                    node, rc, (double)total / (1ULL<<30), p,
+                    (rc==0) ? " (bound)" : " (unbound -> first-touch!)");
+        return p;
+    }
+
+    // Shard the gate+up block [E][2I][H/2] across nshard_ nodes: node n owns gate
+    // rows [n*I/NS,(n+1)*I/NS) and up rows [I+n*I/NS, I+(n+1)*I/NS).
+    bool shard_fill_w13(const void* src) {
+        if (!src || nshard_ < 2) return false;
+        const size_t H = cfg_.hidden_size, I = cfg_.intermediate_size, E = cfg_.expert_num;
+        const size_t rowbytes = H / 2;
+        const size_t n2 = 2 * I;
+        const size_t stride = n2 * rowbytes;
+        const size_t total = stride * E;
+        const int NS = nshard_;
+        size_t base = shard_owned_.size();
+        const uint8_t* s = static_cast<const uint8_t*>(src);
+        for (int n = 0; n < NS; ++n) {
+            const size_t rs = (size_t)n * I / NS, re = (size_t)(n + 1) * I / NS;
+            const size_t cbytes = (re - rs) * rowbytes;
+            void* p = shard_region(total, n, s, [&](uint8_t* d, const uint8_t* srcx, size_t) {
+                for (size_t e = 0; e < E; ++e) {
+                    const size_t eb = e * stride;
+                    std::memcpy(d + eb + rs * rowbytes, srcx + eb + rs * rowbytes, cbytes);         // gate
+                    std::memcpy(d + eb + (I + rs) * rowbytes, srcx + eb + (I + rs) * rowbytes, cbytes); // up
+                }
+            });
+            if (!p) { while (shard_owned_.size() > base) { munmap(shard_owned_.back(), 0); shard_owned_.pop_back(); } return false; }
+            w13_shard_[n] = static_cast<const uint8_t*>(p);
+            shard_owned_.push_back(p);
+        }
+        if (std::getenv("XIAOTU_MOE_SHARD_DIAG") != nullptr)
+            fprintf(stderr, "[SHARD-DIAG] w13 sharding OK NS=%d total=%.1fGiB\n", NS, (double)total/(1ULL<<30));
+        return true;
+    }
+
+    // Shard the down block [E][H][I/2] across nshard_ nodes: node n owns rows
+    // [n*H/NS,(n+1)*H/NS).
+    bool shard_fill_w2(const void* src) {
+        if (!src || nshard_ < 2) return false;
+        const size_t H = cfg_.hidden_size, I = cfg_.intermediate_size, E = cfg_.expert_num;
+        const size_t rowbytes = I / 2;
+        const size_t stride = H * rowbytes;
+        const size_t total = stride * E;
+        const int NS = nshard_;
+        size_t base = shard_owned_.size();
+        const uint8_t* s = static_cast<const uint8_t*>(src);
+        for (int n = 0; n < NS; ++n) {
+            const size_t rs = (size_t)n * H / NS, re = (size_t)(n + 1) * H / NS;
+            const size_t cbytes = (re - rs) * rowbytes;
+            void* p = shard_region(total, n, s, [&](uint8_t* d, const uint8_t* srcx, size_t) {
+                for (size_t e = 0; e < E; ++e) {
+                    const size_t eb = e * stride;
+                    std::memcpy(d + eb + rs * rowbytes, srcx + eb + rs * rowbytes, cbytes);
+                }
+            });
+            if (!p) { while (shard_owned_.size() > base) { munmap(shard_owned_.back(), 0); shard_owned_.pop_back(); } return false; }
+            w2_shard_[n] = static_cast<const uint8_t*>(p);
+            shard_owned_.push_back(p);
+        }
+        if (std::getenv("XIAOTU_MOE_SHARD_DIAG") != nullptr)
+            fprintf(stderr, "[SHARD-DIAG] w2 sharding OK NS=%d total=%.1fGiB\n", NS, (double)total/(1ULL<<30));
+        return true;
+    }
+
+    // Fill per-socket replicas of one weight block (src -> dst[s]), mmap'd and
+    // interleaved within socket s. On partial failure, munmaps only this call's
+    // buffers and clears nsock_ so the single-copy fallback is used.
+    void sock_fill(const void* src, size_t bytes,
+                   std::vector<void*>& owned, const void** dst) {
+        dst[0] = dst[1] = nullptr;
+        if (!src || nsock_ < 2) return;
+        int ok = 0;
+        size_t base = owned.size();
+        for (int s = 0; s < 2; ++s) {
+            void* p = numa_socket_alloc(bytes, s);
+            if (!p) break;
+            std::memcpy(p, src, bytes);
+            owned.push_back(p);
+            dst[s] = p;
+            ++ok;
+        }
+        if (ok < 2) {
+            while (owned.size() > base) { munmap(owned.back(), 0); owned.pop_back(); }
+            dst[0] = dst[1] = nullptr;
+            nsock_ = 1;
+        }
+    }
     // Scratch shared by the two expert-grouping phases within one forward call.
     // Guarded by mtx_ so accidental concurrent forward_many on the same engine is
     // safe (the fork processes layers sequentially; concurrent calls are serialized).

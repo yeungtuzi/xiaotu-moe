@@ -21,3 +21,16 @@ dist/
 
 # Regenerable data artifacts (built via scripts/_prep_real.py)
 *.npz
+
+# Intermediate / working data — the project process directory. ALL intermediate
+# benchmark data, logs, build errors, decomp drafts, mock scripts, backups, etc.
+# live here (gitignored, never committed). Keep the committed tree clean.
+/process_data/
+
+# Build-dependency venv / deb cache (kept in place; rebuild.sh uses
+# .search-venv for pybind11 headers — do NOT move). Never committed.
+/.search-venv/
+/.build_deps/
+
+# Unrelated nested project (its own git repo) — not part of the deliverable.
+/diesel-engine-3d/

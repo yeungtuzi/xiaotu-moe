@@ -18,6 +18,67 @@ Versioning: `MAJOR.MINOR`. `0.11` is the first tagged performance-aligned releas
 
 ---
 
+## [0.12] — 2026-09-06 — cudagraph FULL_DECODE_ONLY break-through + thread-geometry calibration
+
+Follow-on performance release in the same "align/optimize xiaotu-moe toward the
+closed-source lk-moe" effort. The headline is a **2.2× end-to-end throughput
+breakthrough from vLLM server configuration, not from the CPU kernel** — the
+per-decode-step **host GPU orchestration** (43 CPU MoE layers, each launching +
+syncing a GPU kernel per layer per token) was the real ~33 tok/s ceiling. Enabling
+`--compilation_config.cudagraph_mode FULL_DECODE_ONLY` (the exact config the
+production lk server uses) replays one breakable CUDA graph per decode step and
+removes that host latency, taking Total throughput from **~33 → 66.6 tok/s**.
+
+This release also records the **correct CPU hardware model** (a dual-socket EPYC
+9654: 192 *physical* cores, 96/socket, SMT OFF, 12 CCDs/socket sharing one IOD
+with a 12-channel DDR5 controller) and calibrates thread geometry accordingly.
+
+### Added / Changed
+- **Recorded hardware truth + thread calibration** (see also `docs/THREAD_GEOMETRY.md`):
+  dual-socket EPYC 9654, 192 physical cores (96/socket), **SMT OFF**, 12 CCDs ×
+  8 cores/CCD per socket, 12 CCDs sharing one IOD / 12-channel DDR5. The
+  user-mandated production layout is **168 threads = 84/socket, 7/CCD**
+  (saturates each socket's IOD bandwidth while leaving 1 core/CCD for other
+  tasks). An earlier "96 = one-thread-per-physical-core avoids SMT/HT" theory is
+  **retracted** — there is no SMT here; 96 threads merely under-utilize the
+  machine to 48/socket.
+- **3-barrier phase fusion kept** — the sharded decode hot path now runs
+  exactly **3** `parallel_for` barriers (A: gate+up+gated-SiLU+f32→bf16 fused,
+  B: down, C: weighted reduce), matching the 3 `do_k_work_stealing_job` barriers
+  found in the lk-moe decompilation. Neutrally fast and numerically identical
+  (the earlier 5-phase 5-barrier version is gone; fusion is retained).
+- **spin-based synchronization** in `numa_pool.hpp` — hot-restart busy-spin and
+  completion spin replace per-`parallel_for` mutex/condvar futex storms, mirroring
+  lk-moe's lock-free atomic + busy-yield sync (0 syscalls per barrier).
+- **cudagraph FULL_DECODE_ONLY server config** — the new recommended production
+  setting (`--compilation_config.cudagraph_mode FULL_DECODE_ONLY` +
+  `--gpu-memory-utilization 0.62`); the earlier default `NONE` left ~2.2× on the
+  table via host orchestration.
+
+### Performance (dual-socket EPYC 9654, 192 physical cores, SMT OFF, A100/GPU2,
+50 prompts / conc-4 / ml 8192, all 43 MoE layers on the xiaotu CPU engine)
+
+| Config | Total (tok/s) | Median TPOT (ms) | 50/50 |
+|---|---:|---:|---:|
+| cudagraph NONE @ 168 | 32.00 | 213.1 | 50/0 |
+| cudagraph NONE @ 96 | 34.71 | 205.2 | 50/0 |
+| **FULL_DECODE_ONLY @ 168 (mandated) — v0.12** | **66.62** | **79.83** | 50/0 |
+| FULL_DECODE_ONLY @ 96 | 77.75 | 67.29 | 50/0 |
+| FULL_DECODE_ONLY @ 120 (5/CCD guide) | **77.69** | **73.65** | 50/0 |
+
+Root cause of the whole ~33-35 ceiling: **per-decode-step host orchestration**,
+not the CPU MoE kernel and not the barriers. `FULL_DECODE_ONLY` removes it; the
+real MoE+lite workload is ~1.6 ms/layer × 43 ≈ 67 ms.
+
+### Known limitation (REOPENED hard blocker: memory footprint)
+During a short 50-prompt bench the EngineCore VmRSS grew to a **peak ~554 GB**
+at startup+decode (~24 GB/min through decode), far above the lk-moe's ~256 G and
+the user's ≤ ~300 G requirement. **Performance DoD is met, but the memory
+footprint must still be reduced** before xiaotu-moe is operationally equivalent.
+Tracked via O(1) `/proc/PID/status` sampling.
+
+---
+
 ## [0.11] — 2026-09-04 — Alignment Iteration toward lk-moe / ktransformers
 
 Core deliverable of the "keep aligning/optimizing xiaotu-moe so performance

@@ -26,9 +26,12 @@
 #define XIAOTU_MOE_MOE_V2_PACKED4_HPP
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -67,6 +70,39 @@ static inline float hsum256(__m256 v) {
     return _mm_cvtss_f32(s);
 }
 
+#if defined(__AVX512F__)
+// horizontal sum of a 512-bit vector into a scalar (fnm/blend-free).
+static inline float hsum512(__m512 v) {
+    __m256 lo = _mm512_castps512_ps256(v);
+    __m256 hi = _mm512_extractf32x8_ps(v, 1);
+    __m256 s = _mm256_add_ps(lo, hi);
+    return hsum256(s);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Fast-path memory profiler (DISABLED unless XIAOTU_MOE_BYTEPROF is set).
+// Counts raw weight bytes read per fast-path call + wall time to measure the
+// engine's real streaming bandwidth (MB/s) for the packed4 gate/up/down GEMMs.
+// ---------------------------------------------------------------------------
+static std::atomic<uint64_t> g_bp_bytes{0}, g_bp_ns{0}, g_bp_calls{0};
+static std::atomic<uint64_t> g_bp_Lbytes{0}, g_bp_Lns{0}, g_bp_Lcalls{0}; // large (>=512KB)
+static inline bool byteprof_on() {
+    static const bool on = (std::getenv("XIAOTU_MOE_BYTEPROF") != nullptr);
+    return on;
+}
+static inline void byteprof_accum(size_t bytes, uint64_t ns) {
+    g_bp_bytes += bytes; g_bp_ns += ns; g_bp_calls += 1;
+    if (bytes >= (size_t)(512 << 10)) { g_bp_Lbytes += bytes; g_bp_Lns += ns; g_bp_Lcalls += 1; }
+    uint64_t c = g_bp_calls.load(std::memory_order_relaxed);
+    if ((c % 200) == 0) {
+        double agg = (double)g_bp_bytes.load() / 1e6 / std::max((double)g_bp_ns.load()/1e9, 1e-12);
+        double Lag = (double)g_bp_Lbytes.load() / 1e6 / std::max((double)g_bp_Lns.load()/1e9, 1e-12);
+        fprintf(stderr, "[BYTEPROF] calls=%llu agg=%.0f MB/s  LARGE(>=512KB) calls=%llu bytes=%.1fMB ns=%.0f agg=%.0f MB/s\n",
+                (unsigned long long)c, agg,
+                (unsigned long long)g_bp_Lcalls.load(), (double)g_bp_Lbytes.load()/1e6, (double)g_bp_Lns.load(), Lag);
+    }
+}
 // fp8_e8m0fnu ("ue8m0") decode: scale = 2^(byte - 127). This is how the fork's
 // Mxfp4MoEMethod feeds DeepSeek-V4-Flash MXFP4 scales (raw uint8 bytes, verified
 // against real lk_moe MOE_MXFP4: median ratio 1.0001 vs torch truth). Lazy
@@ -175,10 +211,13 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                                  float global_scale, float* C,
                                  int M, int N, int K,
                                  int groupN, int groupK,
-                                 int n0 = 0, int n1 = -1) {
+                                 int n0 = 0, int n1 = -1,
+                                 int rowshift = 0) {
     if (K <= 0 || (K & 1)) return;  // packed layout requires even K
     if (n1 < 0 || n1 > N) n1 = N;
     if (n1 <= n0) return;
+    // rowshift > 0 means W is a shard holding global rows [rowshift, rowshift+N):
+    // local row j (global output row j) reads weight slice row j - rowshift.
     const int gn = groupN > 0 ? groupN : 1;
     const int gk = groupK > 0 ? groupK : 1;
     const float* Srow = static_cast<const float*>(S);
@@ -187,6 +226,149 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         if constexpr (E8M0) return e8m0_table()[static_cast<const uint8_t*>(S)[idx]];
         return Srow[idx];
     };
+#if defined(__AVX512F__)
+    // ----------------------------------------------------------------------
+    // FAST FP4 (E2M1) gather-free AVX512 path, matching the approach used by
+    // lk-moe's `_avx512_*` engine (decompile: PSHUFB nibble decode -> vpmovzx
+    // zero-extend -> vcvtdq2ps -> vfmadd231ps, FP32 accumulate on the 512-bit
+    // datapath -- no BF16 materialization, no int8). Keeps weights FP4 (packed
+    // 2 values/byte) and dequantizes to FP32 in-kernel; on Zen4 the 512-bit
+    // `_mm512_fmadd_ps` runs ~2x the FMA rate of the old 256-bit mul+add path.
+    // Decoded into NATURAL column order so activations need no permutation
+    // (dot = sum_k A[k]*W[k]); semantics identical to the AVX2 path below.
+    // ----------------------------------------------------------------------
+    if (FAST_FP4 && gk == 32 && (K & 31) == 0 && (size_t)M * (size_t)K <= (size_t)(4 << 20)) {
+        const bool bp_on = byteprof_on();
+        uint64_t bp_t0 = 0;
+        if (bp_on) bp_t0 = std::chrono::steady_clock::now().time_since_epoch().count();
+        // Activations -> FP32 in NATURAL (non-permuted) order once, so the inner
+        // loop pairs plain zmm loads with the decoded natural-order weights.
+        thread_local std::vector<float> a32_storage;
+        if (a32_storage.size() < (size_t)M * (size_t)K) a32_storage.resize((size_t)M * (size_t)K);
+        float* a32 = a32_storage.data();
+        for (int mi = 0; mi < M; mi++) {
+            const uint16_t* a_row = A + (size_t)mi * K;
+            float* p_row = a32 + (size_t)mi * K;
+            for (int k = 0; k < K; k++) p_row[k] = bf16::bf16_to_fp32(a_row[k]);
+        }
+        // E2M1 -> BF16 byte LUTs (same values as packed4::E2M1, APACHE-2.0 ktransformers).
+        alignas(16) static constexpr uint8_t fp4_bf16_lo[16] = {
+            0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,
+            0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0};
+        alignas(16) static constexpr uint8_t fp4_bf16_hi[16] = {
+            0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,
+            0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0};
+        const __m256i lut_lo256_ = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)fp4_bf16_lo));
+        const __m256i lut_hi256_ = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)fp4_bf16_hi));
+        const __m128i nib_mask = _mm_set1_epi8(0x0F);
+        // Decode one 32-value K-group (16 packed bytes at b_row+g*16) into
+        // 32 bf16(u16) in NATURAL column order [W0..W31] (nibble c%2 of byte c/2).
+#define XIAOTU_DECODE_GROUP_AVX512(b_row, g_in)                                        \
+        const __m128i raw_ = _mm_loadu_si128((const __m128i*)((b_row) + (size_t)(g_in) * 16)); \
+        const __m128i lo_ = _mm_and_si128(raw_, nib_mask);                            \
+        const __m128i hi_ = _mm_and_si128(_mm_srli_epi16(raw_, 4), nib_mask);         \
+        const __m128i sello_ = _mm_unpacklo_epi8(lo_, hi_);  /* nibbles, cols 0..15 */ \
+        const __m128i selhi_ = _mm_unpackhi_epi8(lo_, hi_);  /* nibbles, cols16..31 */ \
+        const __m256i sel_ = _mm256_inserti128_si256(_mm256_castsi128_si256(sello_), selhi_, 1); \
+        const __m256i bl_ = _mm256_shuffle_epi8(lut_lo256_, sel_); /* lo byte/col */  \
+        const __m256i bh_ = _mm256_shuffle_epi8(lut_hi256_, sel_); /* hi byte/col */  \
+        /* NOTE: _mm256_unpack*_epi8 operate per 128-bit lane, so the interleaved
+           u16 land split as [lo-lane(u_lo=cols0-7) | hi-lane(u_lo=cols16-23)] and
+           u_hi=[cols8-15 | cols24-31]. Recombine the two lane-halves into
+           contiguous natural halves before the word->zmm widen:                */ \
+        const __m256i u_lo_ = _mm256_unpacklo_epi8(bl_, bh_);  /* [c0..7 | c16..23] */ \
+        const __m256i u_hi_ = _mm256_unpackhi_epi8(bl_, bh_);  /* [c8..15 | c24..31] */ \
+        const __m256i A_ = _mm256_inserti128_si256(                                 \
+            _mm256_castsi128_si256(_mm256_extracti128_si256(u_lo_, 0)),             \
+            _mm256_extracti128_si256(u_hi_, 0), 1);  /* [c0..7 | c8..15] = c0..15 */ \
+        const __m256i B_ = _mm256_inserti128_si256(                                 \
+            _mm256_castsi128_si256(_mm256_extracti128_si256(u_lo_, 1)),             \
+            _mm256_extracti128_si256(u_hi_, 1), 1);  /* [c16..23 | c24..31]        */ \
+        const __m512i ilo_ = _mm512_cvtepu16_epi32(A_); /* u32 = 0x0000_XXXX */    \
+        /* bf16->fp32 = pattern<<16 (round-toward-zero), matching the AVX2 path's
+           _mm256_unpacklo_epi16(zero,u16). Shift (NOT vcvtdq2ps) keeps the numeric
+           value: vcvtdq2ps would reinterpret the bf16 pattern as an integer. */   \
+        const __m512 wlo_ = _mm512_castsi512_ps(_mm512_slli_epi32(ilo_, 16));      \
+        const __m512i ihi_ = _mm512_cvtepu16_epi32(B_);                            \
+        const __m512 whi_ = _mm512_castsi512_ps(_mm512_slli_epi32(ihi_, 16));
+
+        const int group_count = K / 32;
+        for (int j = n0; j < n1; ++j) {
+            const uint8_t* b_row = W + (size_t)(j - rowshift) * (K / 2);
+            if (j + 1 < n1) {
+                const char* nr = (const char*)(W + (size_t)(j + 1 - rowshift) * (K / 2));
+                _mm_prefetch(nr, _MM_HINT_T0);
+                _mm_prefetch(nr + 64, _MM_HINT_T0);
+                _mm_prefetch(nr + 128, _MM_HINT_T0);
+                _mm_prefetch(nr + 192, _MM_HINT_T0);
+            }
+            // 4-token blocked path: decode each group once, feed 4x zmm accumulators.
+            int mi = 0;
+            for (; mi + 4 <= M; mi += 4) {
+                const float* p0 = a32 + (size_t)(mi + 0) * K;
+                const float* p1 = a32 + (size_t)(mi + 1) * K;
+                const float* p2 = a32 + (size_t)(mi + 2) * K;
+                const float* p3 = a32 + (size_t)(mi + 3) * K;
+                __m512 a0[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps()};
+                __m512 a1[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps()};
+                __m512 a2[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps()};
+                __m512 a3[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps()};
+                for (int g = 0; g < group_count; g++) {
+                    const int base = g * 32;
+                    XIAOTU_DECODE_GROUP_AVX512(b_row, g);
+                    const float scale = scale_at(j, g * 32);
+                    const __m512 sv = _mm512_set1_ps(scale);
+                    // ILP-16: round-robin over 4 independent partial chains per
+                    // token (4 tokens x 4 partials = 16 in-flight vfmadd231ps),
+                    // mirroring lk's 8x64 tile of 16 independent zmm accumulators.
+                    // Breaks the serial FMA dependency chain so EPYC's ~4-cycle
+                    // FMA latency is hidden; reassociates fp32 (fine for inference).
+                    const int p = g & 3;
+                    __m512 d0 = _mm512_mul_ps(wlo_, _mm512_loadu_ps(p0 + base));
+                    d0 = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(p0 + base + 16), d0);
+                    a0[p] = _mm512_fmadd_ps(d0, sv, a0[p]);
+                    __m512 d1 = _mm512_mul_ps(wlo_, _mm512_loadu_ps(p1 + base));
+                    d1 = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(p1 + base + 16), d1);
+                    a1[p] = _mm512_fmadd_ps(d1, sv, a1[p]);
+                    __m512 d2 = _mm512_mul_ps(wlo_, _mm512_loadu_ps(p2 + base));
+                    d2 = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(p2 + base + 16), d2);
+                    a2[p] = _mm512_fmadd_ps(d2, sv, a2[p]);
+                    __m512 d3 = _mm512_mul_ps(wlo_, _mm512_loadu_ps(p3 + base));
+                    d3 = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(p3 + base + 16), d3);
+                    a3[p] = _mm512_fmadd_ps(d3, sv, a3[p]);
+                }
+                const __m512 s0 = _mm512_add_ps(_mm512_add_ps(a0[0], a0[1]), _mm512_add_ps(a0[2], a0[3]));
+                const __m512 s1 = _mm512_add_ps(_mm512_add_ps(a1[0], a1[1]), _mm512_add_ps(a1[2], a1[3]));
+                const __m512 s2 = _mm512_add_ps(_mm512_add_ps(a2[0], a2[1]), _mm512_add_ps(a2[2], a2[3]));
+                const __m512 s3 = _mm512_add_ps(_mm512_add_ps(a3[0], a3[1]), _mm512_add_ps(a3[2], a3[3]));
+                C[(size_t)(mi + 0) * N + j] = hsum512(s0) * global_scale;
+                C[(size_t)(mi + 1) * N + j] = hsum512(s1) * global_scale;
+                C[(size_t)(mi + 2) * N + j] = hsum512(s2) * global_scale;
+                C[(size_t)(mi + 3) * N + j] = hsum512(s3) * global_scale;
+            }
+            // Single-row remainder (also the whole path when M == 1).
+            for (; mi < M; mi++) {
+                const float* p0 = a32 + (size_t)mi * K;
+                __m512 total0 = _mm512_setzero_ps();
+                for (int g = 0; g < group_count; g++) {
+                    const int base = g * 32;
+                    XIAOTU_DECODE_GROUP_AVX512(b_row, g);
+                    __m512 d = _mm512_mul_ps(wlo_, _mm512_loadu_ps(p0 + base));
+                    d = _mm512_fmadd_ps(whi_, _mm512_loadu_ps(p0 + base + 16), d);
+                    const float scale = scale_at(j, g * 32);
+                    total0 = _mm512_fmadd_ps(d, _mm512_set1_ps(scale), total0);
+                }
+                C[(size_t)mi * N + j] = hsum512(total0) * global_scale;
+            }
+        }
+        if (bp_on) {
+            auto bp_t1 = std::chrono::steady_clock::now().time_since_epoch().count();
+            byteprof_accum((size_t)(n1 - n0) * (size_t)(K / 2), (uint64_t)(bp_t1 - bp_t0));
+        }
+        return;
+    }
+#endif  // __AVX512F__
+
 #if defined(__AVX2__)
     // ----------------------------------------------------------------------
     // FAST FP4 (E2M1) gather-free path, ported from KVCache.AI ktransformers
@@ -199,6 +381,9 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
     // xiaotu's (byte = 2 consecutive K elements, low nibble = even k).
     // ----------------------------------------------------------------------
     if (FAST_FP4 && gk == 32 && (K & 31) == 0 && (size_t)M * (size_t)K <= (size_t)(4 << 20)) {
+        const bool bp_on = byteprof_on();
+        uint64_t bp_t0 = 0;
+        if (bp_on) bp_t0 = std::chrono::steady_clock::now().time_since_epoch().count();
         // Decode emission order within each 32-value group (see macro below).
         static constexpr int kPerm[32] = {0,  2,  4,  6,  1,  3,  5,  7,  8,  10, 12, 14, 9,  11, 13, 15,
                                           16, 18, 20, 22, 17, 19, 21, 23, 24, 26, 28, 30, 25, 27, 29, 31};
@@ -245,11 +430,11 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         const __m256 w3_ = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero256, u16b_))
 
         for (int j = n0; j < n1; ++j) {
-            const uint8_t* b_row = W + (size_t)j * (K / 2);
+            const uint8_t* b_row = W + (size_t)(j - rowshift) * (K / 2);
             // ktransformers alignment: prefetch the next weight row ahead of the
             // FMA stream (bandwidth-bound; hides DRAM latency for the next row).
             if (j + 1 < n1) {
-                const char* nr = (const char*)(W + (size_t)(j + 1) * (K / 2));
+                const char* nr = (const char*)(W + (size_t)(j + 1 - rowshift) * (K / 2));
                 _mm_prefetch(nr, _MM_HINT_T0);
                 _mm_prefetch(nr + 64, _MM_HINT_T0);
                 _mm_prefetch(nr + 128, _MM_HINT_T0);
@@ -317,6 +502,10 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
                 C[(size_t)mi * N + j] = hsum256(_mm256_add_ps(total0, total1)) * global_scale;
             }
         }
+        if (bp_on) {
+            auto bp_t1 = std::chrono::steady_clock::now().time_since_epoch().count();
+            byteprof_accum((size_t)(n1 - n0) * (size_t)(K / 2), (uint64_t)(bp_t1 - bp_t0));
+        }
         return;
     }
     // FAST_FP4 cross-parity fallback (gk != 32 or K%32 != 0): FP4 E2M1 dequant
@@ -332,7 +521,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         const uint16_t* Arow = A + (size_t)i * K;
         float* Crow = C + (size_t)i * N;
         for (int j = n0; j < n1; ++j) {
-            const uint8_t* Wrow = W + (size_t)j * (K / 2);
+            const uint8_t* Wrow = W + (size_t)(j - rowshift) * (K / 2);
             __m256 total = _mm256_setzero_ps();
             int kbase = 0;
             for (; kbase < K; kbase += gk) {
@@ -418,7 +607,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
         const uint16_t* Arow = A + (size_t)i * K;
         float* Crow = C + (size_t)i * N;
         for (int j = n0; j < n1; ++j) {
-            const uint8_t* Wrow = W + (size_t)j * (K / 2);
+            const uint8_t* Wrow = W + (size_t)(j - rowshift) * (K / 2);
             float acc = 0.f;
             for (int k = 0; k < K; ++k)
                 acc += bf16::bf16_to_fp32(Arow[k]) *
