@@ -75,6 +75,34 @@ Dual-socket EPYC 9654 (192 **physical** cores, SMT OFF) + A100/GPU2,
 Correctness: 50/50 pass, 0 failed, 0 stall. Long-term alignment ToDo:
 [`docs/TODO_LONGTERM.md`](docs/TODO_LONGTERM.md).
 
+## 硬件与测试环境 Hardware & test environment (v0.12)
+
+The following benchmark numbers were measured on this box:
+
+| 项 Item | 值 Value |
+|---|---|
+| CPU | **2 × AMD EPYC 9654**（dual socket） |
+| 物理核心 Physical cores | **192 = 96/socket**，**SMT 关闭 OFF**（每 core 仅 1 logical CPU） |
+| CCD 拓扑 | 每路 **12 CCD × 8 cores/CCD**，12 CCD 共用 1 个 IOD + **12 通道 DDR5 内存控制器** |
+| 内存带宽 Memory BW | 每路 IOD DDR5 固定带宽（带宽受限型 MoE 的硬上限） |
+| GPU | NVIDIA A100（测试用 **GPU2**，`tensor-parallel-size 1`），生产服务在 GPU0/1 |
+| 模型 Model | **DeepSeek-V4-Flash-0731**（~155 GB 权重工作集，43 个 MoE 层全走 xiaotu CPU 引擎） |
+| 基准 Benchmark | ShareGPT，**50 prompts / concurrency 4 / max-model-len 8192** |
+| vLLM | `--compilation_config.cudagraph_mode FULL_DECODE_ONLY`、`--kv-cache-dtype fp8_ds_mla`、`--gpu-memory-utilization 0.62`、BF16 |
+| 生产线程布局 | **168 = 84/socket · 7/CCD**（饱和 IOD 带宽 + 每 CCD 留 1 核给宿主其他任务） |
+
+> 详细线程几何与"为什么 96≈120 > 168"的带宽饱和分析见
+> [`docs/THREAD_GEOMETRY.md`](docs/THREAD_GEOMETRY.md)。
+
+## 已知问题 Known issues
+
+| 优先级 | 问题 | 状态 |
+|---|---|---|
+| 🔴 **高** | **原生模式内存占用过高**：未做裁剪时真实大模型进程峰值 VmRSS 可达 **~554 GB**，远超模型权重工作集（~155 GB）也远超 lk 参考的 256 GB；解码期观察到"只增不减"的持续增长（~24 GB/min）。**正在排查修复（目标 ≤256 GB）**。 | 调查中 |
+| 🟡 中 | WNA16（FP8）路径存在既有 `packed4` 打包 bug——flat 与 sharded 均失败；该格式非主打格式，不影响真实 BF16/MXFP4 推理。 | 已知，不修 |
+| 🟡 中 | MXFP4 sharded 池偶发竞态（E=2 H=512 合成形状）——既有 sharded-pool 竞态，与融合/线程/cudagraph 无关，从未影响 50/50 真实基准。 | 已知 |
+| 🟢 说明 | DeepSeek-V4 需 `--kv-cache-dtype fp8_ds_mla` + 足够 `--gpu-memory-utilization`（0.62）供 FULL_DECODE_ONLY graph；`VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP=0` 可跳过 ~20 min 预热。 | 用法说明 |
+
 ## License
 
 Apache-2.0. High-performance kernels reference
