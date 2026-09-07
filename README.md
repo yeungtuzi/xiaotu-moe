@@ -134,6 +134,33 @@ sysctl is `always`.
 TPOT **108 ms**, **50/50** correct — all at / under the 256 GB / 51 tok/s / 177 ms targets.
 The same config under THP `always` peaks ~657 GB (memory target missed).
 
+### Performance vs memory: a user toggle
+
+`XIAOTU_MOE_SHARD_HUGEPAGE` (env) is the switch, plus the host THP sysctl:
+
+| Mode | `XIAOTU_MOE_SHARD_HUGEPAGE` | host THP | Peak VmRSS | Total tok/s | Mean TPOT | Peak output | Pick when |
+|---|---|:---:|:---:|:---:|:---:|:---:|---|
+| **Memory mode** (default) | `0` | `madvise` | **244 GB** | 59.5 | 108 ms | 92 | host can spare ~<=400 GB RAM |
+| **Performance mode** | `1` | any (engine re-requests 2 MB hugepages) | **~657 GB** | **76.6** | **87 ms** | 92 | host can spare ~>=900 GB RAM |
+
+* The **memory mode** is what the serve scripts boot into by default
+  (`XIAOTU_MOE_SHARD_HUGEPAGE=0`, `max-num-batched-tokens 4096`, `max-num-seqs 4`,
+  96 threads). Peak 244 GB, all DoD targets met.
+* The **performance mode** re-enables 2 MB hugepages on the NUMA shard regions
+  (`XIAOTU_MOE_SHARD_HUGEPAGE=1`). It recovers the throughput the 4 KB page mode
+  gives up — the 2 MB hugepages cut TLB misses on the streaming node-local weight
+  reads — at the cost of the ~5.5× resident footprint. **Use it only on hosts with
+  ample RAM.** Enable on the command line:
+  `XIAOTU_MOE_SHARD_HUGEPAGE=1 serve_xiaotu_dsv4_t168_cg.sh`
+  (or `EXTRA_ARGS` / plain export). This is validated under host THP `madvise`;
+  under `always` the OS overrides the knob either way.
+* **Where neither knob can save you:** the remaining P99 TTFT ~19 s is CPU-prefill
+  latency, and total throughput here is prefill-bound — the same at both modes.
+  cudagraph `FULL_DECODE_ONLY` (kept ON) is the biggest fixed win; speculative
+  `dspark`5 *hurt* this CPU engine (output 15 vs 19, TPOT 216 vs 108 ms); GPU
+  prefill (`LVLLM_GPU_PREFILL_MIN_BATCH_SIZE`) crashes in the xiaotumoe env
+  (`moe_kernel` not built) so it is not an option there.
+
 ## Performance notes
 
 Two optimizations were implemented and measured (see §10 of the [project

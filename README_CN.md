@@ -101,6 +101,21 @@ ShareGPT 50 请求 @ 并发 4，`SHARD_HUGEPAGE=0` + `max-num-batched-tokens 409
 峰值 VmRSS **244 GB**、总吞吐 **59.5 tok/s**、平均 TPOT **108 ms**、**50/50** 正确——
 均达到/低于 256 GB / 51 tok/s / 177 ms 目标。同一配置在 THP `always` 下峰值 ~657 GB（内存目标未达标）。
 
+### 性能 vs 内存：用户开关
+
+`XIAOTU_MOE_SHARD_HUGEPAGE`（环境变量）即为开关，配合宿主机 THP sysctl：
+
+| 模式 | `XIAOTU_MOE_SHARD_HUGEPAGE` | 宿主机 THP | 峰值 VmRSS | 总吞吐 | 平均 TPOT | 峰值输出 | 适用场景 |
+|---|---|:---:|:---:|:---:|:---:|:---:|---|
+| **内存模式**（默认） | `0` | `madvise` | **244 GB** | 59.5 | 108 ms | 92 | 宿主机可用内存约 <=400 GB 即可 |
+| **性能模式** | `1` | 任意（引擎重新请求 2 MB 大页） | **~657 GB** | **76.6** | **87 ms** | 92 | 宿主机可用内存约 >=900 GB |
+
+* **内存模式**是 serve 脚本默认启动的配置（`XIAOTU_MOE_SHARD_HUGEPAGE=0`、`max-num-batched-tokens 4096`、`max-num-seqs 4`、96 线程）。峰值 244 GB，全部 DoD 目标达标。
+* **性能模式**在 NUMA 分片区重新启用 2 MB 大页（`XIAOTU_MOE_SHARD_HUGEPAGE=1`）。2 MB 大页能减少流式 node-local 权重读取的 TLB 未命中，恢复 4 KB 页模式放弃的吞吐——代价是约 5.5× 的常驻足迹。**仅在内存充足的宿主机上使用。** 命令行开启：
+  `XIAOTU_MOE_SHARD_HUGEPAGE=1 serve_xiaotu_dsv4_t168_cg.sh`
+  （或 `EXTRA_ARGS` / 直接 export）。该模式在宿主机 THP=`madvise` 下已验证；`always` 下 OS 会以任一方式覆盖该开关。
+* **两种模式都无法解决的：** 剩余 P99 TTFT 约 19 s 是 CPU prefill 延迟，总吞吐受 prefill 限制——两模式下相同。cudagraph `FULL_DECODE_ONLY`（保持开启）是最大的固定收益；投机 `dspark`5 在 CPU 引擎上反而**拖累**（输出 15 vs 19，TPOT 216 vs 108 ms）；GPU prefill（`LVLLM_GPU_PREFILL_MIN_BATCH_SIZE`）在 xiaotumoe 环境中崩溃（`moe_kernel` 未构建），因此不可用。
+
 ## 性能说明
 
 两项优化已实现并实测（详见[项目报告](xiaotu-moe/docs/XIAOTU_MOE_REPORT_cn.md) §10）：
