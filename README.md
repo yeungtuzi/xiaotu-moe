@@ -156,10 +156,29 @@ The same config under THP `always` peaks ~657 GB (memory target missed).
   under `always` the OS overrides the knob either way.
 * **Where neither knob can save you:** the remaining P99 TTFT ~19 s is CPU-prefill
   latency, and total throughput here is prefill-bound — the same at both modes.
-  cudagraph `FULL_DECODE_ONLY` (kept ON) is the biggest fixed win; speculative
-  `dspark`5 *hurt* this CPU engine (output 15 vs 19, TPOT 216 vs 108 ms); GPU
-  prefill (`LVLLM_GPU_PREFILL_MIN_BATCH_SIZE`) crashes in the xiaotumoe env
-  (`moe_kernel` not built) so it is not an option there.
+  cudagraph `FULL_DECODE_ONLY` (kept ON) is the biggest fixed win.
+* **Speculative decoding (dspark/MTP) is a NET LOSS on this CPU engine — confirmed
+  definitively, even with unlimited memory and max batch.** Side-by-side under
+  `mbt 16384 / seqs 8 / conc 8 / 50 prompts` with memory unconstrained, the *only*
+  change being `--speculative-config dspark,5`: no-spec gave Total **62.99** tok/s,
+  Output 28.97, Peak output 168, TPOT 195 ms; +spec gave 49.90 / 22.86 / 48 /
+  349 ms. That's −21% total, −21% output, −71% peak output, +79% TPOT — worsening
+  across the board *despite* real draft acceptance (mean length ~2.1, ~22% draft
+  rate). The reason is not the test set and not memory: this bandwidth‑bound CPU
+  MoE does **not amortize the verify batch** (a K‑token verify costs ≈K× a single
+  token because each token re‑reads expert weights from DRAM), and spec adds
+  overhead (cudagraph capture sizes balloon up to 96 under `mbt 16384`, GPU‑draft
+  sync, resampling). lk_moe's spec is positive only because *its* CPU MoE kernel
+  amortizes the verify batch — a batching capability this engine does not yet have
+  (see *Performance/limitations*). Don't expect `dspark` to pay off until the MoE
+  kernel amortizes batches.
+* **Bigger batches are not a throughput lever either:** `mbt 16384 / seqs 8`
+  (no spec) reaches 62.99 vs 59.54 tok/s for the 4096/4 memory mode, while tripling
+  peak RSS (816 vs 244 GB) and *worsening* TPOT (195 vs 108 ms). Use the small
+  batch; large batch only costs memory and latency here.
+* GPU prefill (`LVLLM_GPU_PREFILL_MIN_BATCH_SIZE`) crashes in the xiaotumoe env
+  (`moe_kernel` not built) so it is not an option there. Best realistic total is
+  currently ~60-63 tok/s (vs lk_moe 105) — the remaining gap is the CPU MoE kernel.
 
 ## Performance notes
 

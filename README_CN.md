@@ -114,7 +114,10 @@ ShareGPT 50 请求 @ 并发 4，`SHARD_HUGEPAGE=0` + `max-num-batched-tokens 409
 * **性能模式**在 NUMA 分片区重新启用 2 MB 大页（`XIAOTU_MOE_SHARD_HUGEPAGE=1`）。2 MB 大页能减少流式 node-local 权重读取的 TLB 未命中，恢复 4 KB 页模式放弃的吞吐——代价是约 5.5× 的常驻足迹。**仅在内存充足的宿主机上使用。** 命令行开启：
   `XIAOTU_MOE_SHARD_HUGEPAGE=1 serve_xiaotu_dsv4_t168_cg.sh`
   （或 `EXTRA_ARGS` / 直接 export）。该模式在宿主机 THP=`madvise` 下已验证；`always` 下 OS 会以任一方式覆盖该开关。
-* **两种模式都无法解决的：** 剩余 P99 TTFT 约 19 s 是 CPU prefill 延迟，总吞吐受 prefill 限制——两模式下相同。cudagraph `FULL_DECODE_ONLY`（保持开启）是最大的固定收益；投机 `dspark`5 在 CPU 引擎上反而**拖累**（输出 15 vs 19，TPOT 216 vs 108 ms）；GPU prefill（`LVLLM_GPU_PREFILL_MIN_BATCH_SIZE`）在 xiaotumoe 环境中崩溃（`moe_kernel` 未构建），因此不可用。
+* **两种模式都无法解决的：** 剩余 P99 TTFT 约 19 s 是 CPU prefill 延迟，总吞吐受 prefill 限制——两模式下相同。cudagraph `FULL_DECODE_ONLY`（保持开启）是最大的固定收益。
+* **投机解码（dspark/MTP）在本 CPU 引擎上是明确的净亏损——即使放开内存上限、最大 batch 也已证实。** 在 `mbt 16384 / seqs 8 / conc 8 / 50 请求`、内存不设限、且唯一变量为 `--speculative-config dspark,5` 的并排对照中：无 spec 为 Total **62.99** tok/s、Output 28.97、峰值输出 168、TPOT 195 ms；+spec 为 49.90 / 22.86 / 48 / 349 ms——即总吞吐 **−21%**、输出 **−21%**、峰值输出 **−71%**、TPOT **+79%**（变慢），**尽管**存在真实的草稿采纳（平均长度 ~2.1、草案采纳率 ~22%）。原因不是测试集，也不是内存：这个带宽受限的 **CPU MoE 不摊销验证批次**（K 个 token 的验证 ≈ 单 token 的 K 倍，因为每个 token 都要从 DRAM 重读专家权重），且 spec 带来额外开销（`mbt 16384` 下 cudagraph 捕获尺寸暴涨到 96、GPU 草稿同步、重采样）。lk_moe 的 spec 之所以正增益，只因为**它的 CPU MoE 内核能摊销验证批次**——本引擎尚未具备这一批处理能力（见*性能/限制*）。在 MoE 内核能摊销 batch 之前，不要指望 `dspark` 有回报。
+* **更大的 batch 也不是吞吐杠杆：** `mbt 16384 / seqs 8`（无 spec）只比 4096/4 内存模式的 62.99 vs 59.54 tok/s 略高，却把峰值 RSS 翻了三倍（816 vs 244 GB）且**恶化** TPOT（195 vs 108 ms）。请用小 batch；大 batch 只会增加内存与延迟。
+* GPU prefill（`LVLLM_GPU_PREFILL_MIN_BATCH_SIZE`）在 xiaotumoe 环境中崩溃（`moe_kernel` 未构建），因此不可用。目前最佳现实总吞吐约 60-63 tok/s（lk_moe 为 105）——剩余差距来自 CPU MoE 内核本身。
 
 ## 性能说明
 
