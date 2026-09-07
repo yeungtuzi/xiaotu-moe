@@ -100,6 +100,40 @@ bridge choices.
 - Full end-to-end on the real checkpoint: real prompt returns output
   **byte-identical to lk_moe**, 0 segfault.
 
+## System requirement: transparent hugepages must be `madvise`, not `always`
+
+> **This is the root cause of the previously-reported ~554–657 GB native-memory peak
+> and it is now fixed — but it is a HOST-SIDE setting, not something the code can
+> override from userland.**
+
+The native CPU MoE engine uses **NUMA-sharded weight placement** for speed: each worker reads
+only its own node's pages (no cross-node traffic). On each shard region it calls
+`madvise(MADV_HUGEPAGE)` but writes only its "owned rows" at full stride (~1/8 of every region).
+If the kernel-wide THP mode is `always`, the kernel promotes those regions to **2 MB hugepages
+regardless of the `madvise` hint**, and once *any* byte of a 2 MB page is touched the **whole
+2 MB page becomes resident**. The strided owned-row writes therefore balloon resident memory to
+≈5.5× the single weight copy — a **load-time footprint that is flat afterwards** (not a decode
+leak): ~657 GB on the ~155 GB model vs the ~250 GB single-copy expectation.
+
+**Fix (run once on the serving host, `root` required):**
+
+```sh
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled   # [always madvise never] choices
+```
+
+Keep it at `madvise` and make sure the engine does *not* re-request hugepages on its shard
+regions (the serve scripts export `XIAOTU_MOE_SHARD_HUGEPAGE=0` by default). Then each shard
+faults only its owned 4 KB pages → a one-copy footprint (~157 GB at load, ~251 GB plateau) while
+retaining node-local read speed. With `always` instead, the same run peaks ~657 GB and misses the
+memory target — the knob **cannot be forced back to 4 KB hugepages from userland** while the
+sysctl is `always`.
+
+**Verified** on DeepSeek-V4-Flash-0731 (~155 GB MoE, dual-socket EPYC 9654, CPU MoE, TP1,
+96 threads, ShareGPT 50 prompts @ conc 4, with `SHARD_HUGEPAGE=0` + `max-num-batched-tokens
+4096` + `max-num-seqs 4`): peak VmRSS **244 GB**, total throughput **59.5 tok/s**, mean
+TPOT **108 ms**, **50/50** correct — all at / under the 256 GB / 51 tok/s / 177 ms targets.
+The same config under THP `always` peaks ~657 GB (memory target missed).
+
 ## Performance notes
 
 Two optimizations were implemented and measured (see §10 of the [project
@@ -147,7 +181,7 @@ EPYC 9654 (192 physical cores, SMT OFF) + A100/GPU2 (tensor-parallel-size 1).
 
 | Priority | Issue | Status |
 |---:|---|---|
-| 🔴 High | **Native-mode memory footprint** — peak VmRSS up to **~554 GB** on the real large model in untrimmed runs, far above the ~155 GB weight working set and the 256 GB lk reference; decode-phase "only grows" accumulation (~24 GB/min). **Under active fix (target ≤256 GB).** | Investigating |
+| 🔴 High | **Native-mode memory footprint** — peak VmRSS up to ~657 GB on the real large model in untrimmed runs, far above the ~155 GB weight working set and the 256 GB lk reference. **Root-caused & fixed: host THP must be `madvise` (system `always` inflated the NUMA shards ~5.5×).** With `madvise` + `XIAOTU_MOE_SHARD_HUGEPAGE=0` the peak drops to **244 GB**. See *System requirement* above. | Resolved |
 | 🟡 Med | WNA16 (FP8) path has a pre-existing `packed4` packing bug (flat & sharded both fail) — not a shipping format, does not affect real BF16/MXFP4 inference. | Known |
 | 🟡 Med | MXFP4 sharded pool occasional race (E=2 H=512 synthetic) — pre-existing, unrelated to fusion/threads/cudagraph, never hit the 50/50 real bench. | Known |
 

@@ -73,6 +73,34 @@ PYTHON=$(which python) bash scripts/build.sh   # 构建 avx512_bf16（或最佳�
 - 纯 CPU 数值 A/B（真实 layer-1 路由专家 vs numpy golden）：MXFP4 max rel ~3.4e-4、NVFP4 ~8.7e-6（远优于 lk_moe 的 ~22% 尾部）。
 - 真实 checkpoint 全端到端：真实 prompt 返回与 lk_moe **逐字节一致**，0 segfault。
 
+## 系统要求：透明大页（THP）必须为 `madvise`，不能是 `always`
+
+> **这就是此前报告的原生模式峰值 ~554–657 GB 内存的根因，现已修复——但它是宿主机设置，
+> 无法由代码在用户态覆盖。**
+
+原生 CPU MoE 引擎采用 **NUMA 分片权重放置**来提速：每个 worker 只读自己节点的页（无跨节点
+流量）。它在每个分片区调用 `madvise(MADV_HUGEPAGE)`，却只以全 stride 写自己的"属主行"
+（约为每个区域的 1/8）。若内核级 THP 模式为 `always`，内核会**无视 `madvise` 提示**，把这些
+区域提升为 **2 MB 大页**；一旦 2 MB 页内*任意*字节被触碰，**整页 2 MB 都会常驻**。于是散布的
+属主行写入把常驻内存放大到约 **5.5 倍单份权重**——是**加载期足迹、之后全程持平**（不是解码泄漏）：
+~155 GB 模型实测 ~657 GB，而单份期望约 250 GB。
+
+**修复（在服务宿主机执行一次，需 `root`）：**
+
+```sh
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled   # [always madvise never] 选项
+```
+
+保持 `madvise`，并确保引擎不在分片区再次请求大页（serve 脚本默认导出 `XIAOTU_MOE_SHARD_HUGEPAGE=0`）。
+这样每个分片只落属主行的 4 KB 页 → 单份足迹（加载 ~157 GB，平台 ~251 GB），同时保留 node-local 读取速度。
+如果仍是 `always`，同样的运行峰值 ~657 GB，内存目标不达标——只要 sysctl 是 `always`，
+这个开关就**无法从用户态强制回 4 KB 大页**。
+
+**实测验证**（DeepSeek-V4-Flash-0731，~155 GB MoE，双路 EPYC 9654，CPU MoE，TP1，96 线程，
+ShareGPT 50 请求 @ 并发 4，`SHARD_HUGEPAGE=0` + `max-num-batched-tokens 4096` + `max-num-seqs 4`）：
+峰值 VmRSS **244 GB**、总吞吐 **59.5 tok/s**、平均 TPOT **108 ms**、**50/50** 正确——
+均达到/低于 256 GB / 51 tok/s / 177 ms 目标。同一配置在 THP `always` 下峰值 ~657 GB（内存目标未达标）。
+
 ## 性能说明
 
 两项优化已实现并实测（详见[项目报告](xiaotu-moe/docs/XIAOTU_MOE_REPORT_cn.md) §10）：
@@ -105,7 +133,7 @@ PYTHON=$(which python) bash scripts/build.sh   # 构建 avx512_bf16（或最佳�
 
 | 优先级 | 问题 | 状态 |
 |---:|---|---|
-| 🔴 高 | **原生模式内存占用过高**：未裁剪时真实大模型进程峰值 VmRSS 可达 **~554 GB**，远超 ~155 GB 权重工作集与 lk 参考的 256 GB；解码期"只增不减"持续增长（~24 GB/min）。**正在修复（目标 ≤256 GB）**。 | 调查中 |
+| 🔴 高 | **原生模式内存占用过高**：未裁剪时真实大模型进程峰值 VmRSS 可达 ~657 GB，远超 ~155 GB 权重工作集与 lk 参考的 256 GB。**已定位根因并修复：宿主机 THP 必须为 `madvise`（系统 `always` 会把 NUMA 分片放大 ~5.5×）。** 设为 `madvise` + `XIAOTU_MOE_SHARD_HUGEPAGE=0` 后峰值降至 **244 GB**。见上文*系统要求*。 | 已解决 |
 | 🟡 中 | WNA16（FP8）路径存在既有 `packed4` 打包 bug（flat 与 sharded 均失败）——非主打格式，不影响真实 BF16/MXFP4 推理。 | 已知 |
 | 🟡 中 | MXFP4 sharded 池偶发竞态（E=2 H=512 合成形状）——既有问题，与融合/线程/cudagraph 无关，从未影响 50/50 真实基准。 | 已知 |
 
